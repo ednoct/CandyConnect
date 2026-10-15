@@ -66,10 +66,10 @@ flutter_launcher_icons:
   image_path: "assets/icon.png"
   macos:
     generate: true
-    image_path: "assets/icon.ico"
+    image_path: "assets/icon.png"
   linux:
     generate: true
-    image_path: "assets/icon.ico"
+    image_path: "assets/icon.png"
   windows:
     generate: true
     image_path: "assets/icon.ico"
@@ -89,6 +89,7 @@ flutter:
   assets:
     - assets/
     - assets/routing/
+    - assets/icons/
   #   - images/a_dot_burr.jpeg
   #   - images/a_dot_ham.jpeg
 

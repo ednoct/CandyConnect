@@ -46,7 +46,7 @@ class DesktopManager with WindowListener, TrayListener {
     trayManager.addListener(this);
     
     // Using default flutter icon for tray based on platform
-    String iconPath = Platform.isWindows ? 'assets/icon.ico' : 'assets/icon.png';
+    String iconPath = Platform.isWindows ? 'assets/icons/tray_icon_off.ico' : 'assets/icons/tray_icon_off.png';
     await trayManager.setIcon(iconPath);
     
     List<MenuItem> items = [
@@ -71,6 +71,18 @@ class DesktopManager with WindowListener, TrayListener {
       ),
     ];
     await trayManager.setContextMenu(Menu(items: items));
+  }
+
+  Future<void> updateTrayIcon(bool isConnected) async {
+    if (!isDesktop) return;
+    try {
+      final String iconPath = Platform.isWindows
+          ? (isConnected ? 'assets/icons/tray_icon.ico' : 'assets/icons/tray_icon_off.ico')
+          : (isConnected ? 'assets/icons/tray_icon.png' : 'assets/icons/tray_icon_off.png');
+      await trayManager.setIcon(iconPath);
+    } catch (e) {
+      debugPrint('Failed to update tray icon: $e');
+    }
   }
 
   @override

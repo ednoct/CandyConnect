@@ -13,6 +13,7 @@ import '../widgets/glass_card.dart';
 import '../widgets/animated_wave_background.dart';
 import '../utils/url_launcher_utils.dart';
 import '../core/xray_bridge.dart';
+import '../core/desktop_manager.dart';
 import '../services/subscription_service.dart';
 import '../services/latency_tester.dart';
 import '../services/dns_manager.dart';
@@ -132,6 +133,12 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     final isPromoDismissed = ref.watch(isPromoDismissedProvider);
     final dismissedNotifs = ref.watch(dismissedNotificationsProvider);
     final stats = ref.watch(subscriptionStatsProvider);
+
+    ref.listen<bool>(isConnectedProvider, (previous, next) {
+      if (previous != next) {
+        DesktopManager().updateTrayIcon(next);
+      }
+    });
 
     // ── Force Disconnect on Expiration ───────────────────────────────────────
     // Listens to the stats provider out-of-band from the build phase. 

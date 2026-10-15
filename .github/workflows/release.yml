@@ -78,6 +78,7 @@ jobs:
           DefaultDirName={autopf}\$env:APP_NAME
           DefaultGroupName=$env:APP_NAME
           UninstallDisplayIcon={app}\$AppExe
+          SetupIconFile=windows\runner\resources\app_icon.ico
           Compression=lzma2/ultra64
           SolidCompression=yes
           OutputDir=dist
@@ -181,10 +182,16 @@ jobs:
 
           ln -s "/opt/${APP_NAME}/${BIN_NAME}" "${PKG_DIR}/usr/bin/candyconnect"
 
-          ICON_FILE=$(find . -name "*icon*.png" -not -path "*/.*" -not -path "*/build/*" | head -n 1)
-          if [ -n "$ICON_FILE" ]; then
-            cp "$ICON_FILE" "${PKG_DIR}/usr/share/pixmaps/candyconnect.png"
-          fi
+          mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/256x256/apps"
+          mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/512x512/apps"
+          ICON_256="assets/icons/app_icon_256.png"
+          ICON_512="assets/icons/app_icon.png"
+          if [ ! -f "$ICON_256" ]; then ICON_256="assets/icon.png"; fi
+          if [ ! -f "$ICON_512" ]; then ICON_512="$ICON_256"; fi
+          cp "$ICON_256" "${PKG_DIR}/usr/share/pixmaps/candyconnect.png"
+          cp "$ICON_256" "${PKG_DIR}/usr/share/icons/hicolor/256x256/apps/candyconnect.png"
+          cp "$ICON_512" "${PKG_DIR}/usr/share/icons/hicolor/512x512/apps/candyconnect.png"
+          cp "$ICON_256" "${PKG_DIR}/opt/${APP_NAME}/icon.png" 
 
           cat <<EOF > "${PKG_DIR}/usr/share/applications/candyconnect.desktop"
           [Desktop Entry]
@@ -197,6 +204,7 @@ jobs:
           Terminal=false
           Categories=Network;Security;VPN;
           StartupNotify=true
+          StartupWMClass=${BIN_NAME}
           EOF
 
           cat <<'EOF' > "${PKG_DIR}/DEBIAN/postinst"
@@ -206,6 +214,9 @@ jobs:
 
           if which update-desktop-database >/dev/null 2>&1; then
             update-desktop-database -q /usr/share/applications || true
+          fi
+          if which gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
           fi
 
           for USER_DIR in /home/*; do
@@ -247,10 +258,9 @@ jobs:
           BIN_NAME=$(find build/linux/x64/release/bundle -maxdepth 1 -type f -executable -printf "%f\n" | head -n 1)
           if [ -z "$BIN_NAME" ]; then BIN_NAME="candyconnect"; fi
 
-          ICON_FILE=$(find . -name "*icon*.png" -not -path "*/.*" -not -path "*/build/*" | head -n 1)
-          if [ -n "$ICON_FILE" ]; then
-            cp "$ICON_FILE" "${TAR_DIR}/icon.png"
-          fi
+          ICON_FILE="assets/icons/app_icon_256.png"
+          if [ ! -f "$ICON_FILE" ]; then ICON_FILE="assets/icon.png"; fi
+          cp "$ICON_FILE" "${TAR_DIR}/icon.png" 
 
           cat <<EOF > "${TAR_DIR}/install.sh"
           #!/bin/bash
@@ -273,6 +283,7 @@ jobs:
           Terminal=false
           Categories=Network;Security;VPN;
           StartupNotify=true
+          StartupWMClass=${BIN_NAME}
           ENTRY
 
           chmod +x "\$DESKTOP_FILE"
