@@ -56,12 +56,6 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-
-        // Restrict packaging to the exact ABIs for which libgojni.so is present,
-        // preventing build failures on ABIs without the native Xray library.
-        ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-        }
     }
 
     signingConfigs {
