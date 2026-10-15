@@ -1,0 +1,25 @@
+{
+    // ── Gradle Extension (vscjava.vscode-gradle) ──────────────────────────────
+    // Force the Gradle extension to use Android Studio's JBR (Java 21)
+    // instead of the system Eclipse JRE 25 it was picking up automatically.
+    "gradle.javaHome": "C:\\Program Files\\Android\\Android Studio\\jbr",
+
+    // Use the project's own gradlew wrapper, not the system Gradle from Scoop.
+    "gradle.useGradleWrapper": true,
+
+    // ── Java Language Server (redhat.java) ────────────────────────────────────
+    // Point the Java LS at Android Studio's JBR so Kotlin/Java sources resolve.
+    "java.jdt.ls.java.home": "C:\\Program Files\\Android\\Android Studio\\jbr",
+    "java.import.gradle.javaHome": "C:\\Program Files\\Android\\Android Studio\\jbr",
+    "java.import.gradle.wrapper.enabled": true,
+
+    // ── Flutter / Dart ────────────────────────────────────────────────────────
+    // Suppress Flutter build output inside the editor terminal.
+    "dart.flutterRunLogFile": null,
+
+    // ── File Associations ─────────────────────────────────────────────────────
+    "files.associations": {
+        "*.kts": "kotlin",
+        "*.gradle": "groovy"
+    }
+}
