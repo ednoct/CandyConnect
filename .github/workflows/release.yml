@@ -320,7 +320,7 @@ jobs:
       - name: Install Dependencies
         run: flutter pub get
 
-      - name: Patch Legacy Android Plugins (jcenter, namespace & JVM 17)
+      - name: Patch Legacy Android Plugins (jcenter, compileSdk 35, namespace & JVM 17)
         run: |
           python3 - << 'EOF'
           import os, re, glob
@@ -328,18 +328,22 @@ jobs:
           pub_cache = os.environ.get('PUB_CACHE', os.path.expanduser('~/.pub-cache'))
           print(f"Scanning PUB_CACHE at: {pub_cache}")
 
-          # 1. Replace jcenter() with mavenCentral() across all cached plugins
+          # 1. Replace jcenter() and upgrade old compileSdkVersion (<35) across all cached plugins
           for root, _, files in os.walk(pub_cache):
               for f in files:
                   if f in ('build.gradle', 'build.gradle.kts'):
                       p = os.path.join(root, f)
                       with open(p, 'r', encoding='utf-8', errors='ignore') as file:
                           content = file.read()
-                      if 'jcenter()' in content:
-                          content = content.replace('jcenter()', 'mavenCentral()')
+                      orig = content
+                      content = content.replace('jcenter()', 'mavenCentral()')
+                      # Upgrade any hardcoded old compileSdkVersion (e.g., 28, 29, 30, 31, 32, 33, 34) to 35
+                      content = re.sub(r'compileSdkVersion\s*=?\s*(2[0-9]|3[0-4])\b', 'compileSdkVersion 35', content)
+                      content = re.sub(r'compileSdk\s*=?\s*(2[0-9]|3[0-4])\b', 'compileSdk = 35', content)
+                      if content != orig:
                           with open(p, 'w', encoding='utf-8') as file:
                               file.write(content)
-                          print(f"[FIXED] Replaced jcenter() in {p}")
+                          print(f"[FIXED] Updated jcenter/compileSdk in {p}")
 
           # 2. Inject missing namespace and JVM 17 compatibility into legacy plugins
           for manifest_path in glob.glob(f"{pub_cache}/hosted/pub.dev/*/android/src/main/AndroidManifest.xml"):
