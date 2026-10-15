@@ -1,4 +1,4 @@
-package online.candyconnect.candyconnect
+package com.vpn.candyconnect
 
 import android.app.Activity
 import android.content.BroadcastReceiver
@@ -11,7 +11,6 @@ import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import com.vpn.candyconnect.CandyVpnService
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "candyconnect/vpn"

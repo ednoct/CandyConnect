@@ -52,12 +52,17 @@ jobs:
           channel: ${{ env.FLUTTER_VERSION }}
           cache: true
 
-      - name: Build Windows Executable
+      - name: Inject CANDY_PAT & Build Windows Executable
         shell: pwsh
+        env:
+          CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
+          if (Test-Path "lib/services/remote_config_service.dart") {
+            (Get-Content "lib/services/remote_config_service.dart") -replace "= 'CANDY_PAT';", "= '$env:CANDY_PAT';" | Set-Content "lib/services/remote_config_service.dart" -Encoding UTF8
+          }
           flutter config --enable-windows-desktop
           flutter pub get
-          flutter build windows --release
+          flutter build windows --release --dart-define=CANDY_PAT="$env:CANDY_PAT"
 
       - name: Create Inno Setup Script & Build Installer
         shell: pwsh
@@ -147,11 +152,16 @@ jobs:
           channel: ${{ env.FLUTTER_VERSION }}
           cache: true
 
-      - name: Build Linux Binary
+      - name: Inject CANDY_PAT & Build Linux Binary
+        env:
+          CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
+          if [ -f "lib/services/remote_config_service.dart" ]; then
+            sed -i "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+          fi
           flutter config --enable-linux-desktop
           flutter pub get
-          flutter build linux --release
+          flutter build linux --release --dart-define=CANDY_PAT="${CANDY_PAT}"
 
       - name: Package Debian / Ubuntu (.deb) Installer
         run: |
@@ -394,10 +404,15 @@ jobs:
                   print(f"[FIXED] Injected namespace '{pkg_name}' into {gradle_path}")
           EOF
 
-      - name: Build Split & Universal APKs
+      - name: Inject CANDY_PAT & Build Split and Universal APKs
+        env:
+          CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
-          flutter build apk --release --split-per-abi --android-skip-build-dependency-validation
-          flutter build apk --release --android-skip-build-dependency-validation
+          if [ -f "lib/services/remote_config_service.dart" ]; then
+            sed -i "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+          fi
+          flutter build apk --release --split-per-abi --android-skip-build-dependency-validation --dart-define=CANDY_PAT="${CANDY_PAT}"
+          flutter build apk --release --android-skip-build-dependency-validation --dart-define=CANDY_PAT="${CANDY_PAT}"
 
       - name: Prepare Android Artifacts
         run: |
@@ -440,11 +455,16 @@ jobs:
           echo "$HOME/flutter/bin" >> $GITHUB_PATH
           echo "$HOME/flutter/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
 
-      - name: Build macOS Release
+      - name: Inject CANDY_PAT & Build macOS Release
+        env:
+          CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
+          if [ -f "lib/services/remote_config_service.dart" ]; then
+            sed -i '' "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+          fi
           flutter config --enable-macos-desktop
           flutter pub get
-          flutter build macos --release
+          flutter build macos --release --dart-define=CANDY_PAT="${CANDY_PAT}"
 
       - name: Create macOS DMG
         run: |
@@ -486,10 +506,15 @@ jobs:
           echo "$HOME/flutter/bin" >> $GITHUB_PATH
           echo "$HOME/flutter/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
 
-      - name: Build iOS App Bundle
+      - name: Inject CANDY_PAT & Build iOS App Bundle
+        env:
+          CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
+          if [ -f "lib/services/remote_config_service.dart" ]; then
+            sed -i '' "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+          fi
           flutter pub get
-          flutter build ios --release --no-codesign
+          flutter build ios --release --no-codesign --dart-define=CANDY_PAT="${CANDY_PAT}"
 
       - name: Package Unsigned IPA
         run: |
