@@ -1,0 +1,504 @@
+name: Build & Release All Platforms
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'نسخه مورد نظر برای ریلیز (مثال: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: 'stable'
+  APP_NAME: 'CandyConnect'
+  APP_ID: 'com.vpn.candyconnect'
+
+jobs:
+  # ==========================================
+  # 1. WINDOWS (INNO SETUP INSTALLER & PORTABLE)
+  # ==========================================
+  build-windows:
+    name: Build Windows (Installer & Portable)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set Version Variable
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Build Windows Executable
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter build windows --release
+
+      - name: Create Inno Setup Script & Build Installer
+        shell: pwsh
+        run: |
+          $AppExe = (Get-ChildItem -Path "build\windows\x64\runner\Release\*.exe" | Select-Object -First 1).Name
+          if (-not $AppExe) { $AppExe = "candyconnect.exe" }
+
+          $IssScript = @"
+          [Setup]
+          AppId={{C4D89A12-B2A4-4E89-94D2-CANDYCONNECT}}
+          AppName=$env:APP_NAME
+          AppVersion=$env:VERSION
+          DefaultDirName={autopf}\$env:APP_NAME
+          DefaultGroupName=$env:APP_NAME
+          UninstallDisplayIcon={app}\$AppExe
+          Compression=lzma2/ultra64
+          SolidCompression=yes
+          OutputDir=dist
+          OutputBaseFilename=$env:APP_NAME-$env:VERSION-windows-x64-setup
+          ArchitecturesInstallIn64BitMode=x64
+          DisableDirPage=no
+          DisableProgramGroupPage=yes
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
+
+          [Files]
+          Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\$env:APP_NAME"; Filename: "{app}\$AppExe"
+          Name: "{autodesktop}\$env:APP_NAME"; Filename: "{app}\$AppExe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\$AppExe"; Description: "{cm:LaunchProgram,$env:APP_NAME}"; Flags: nowait postinstall skipifsilent
+          "@
+
+          New-Item -ItemType Directory -Force -Path dist
+          Set-Content -Path "installer.iss" -Value $IssScript -Encoding UTF8
+
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\$env:APP_NAME-$env:VERSION-windows-x64-portable.zip"
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            dist/*.exe
+            dist/*.zip
+
+  # ==========================================
+  # 2. UBUNTU & LINUX (.DEB & TARBALL WITH SHORTCUTS)
+  # ==========================================
+  build-linux:
+    name: Build Linux (.deb & .tar.gz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set Version Variable
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_VER="${{ github.event.inputs.tag_name }}"
+          else
+            RAW_VER="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "VERSION=${RAW_VER}" >> $GITHUB_ENV
+          CLEAN_VER=$(echo "${RAW_VER}" | sed 's/^v//')
+          echo "DEB_VERSION=${CLEAN_VER}" >> $GITHUB_ENV
+
+      - name: Install System Build Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev \
+            libayatana-appindicator3-dev libkeybinder-3.0-dev libsecret-1-dev
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Build Linux Binary
+        run: |
+          flutter config --enable-linux-desktop
+          flutter pub get
+          flutter build linux --release
+
+      - name: Package Debian / Ubuntu (.deb) Installer
+        run: |
+          mkdir -p dist
+          PKG_DIR="deb_package"
+          rm -rf "${PKG_DIR}"
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/opt/${APP_NAME}"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/usr/share/applications"
+          mkdir -p "${PKG_DIR}/usr/share/pixmaps"
+
+          cp -r build/linux/x64/release/bundle/* "${PKG_DIR}/opt/${APP_NAME}/"
+
+          BIN_NAME=$(find build/linux/x64/release/bundle -maxdepth 1 -type f -executable -printf "%f\n" | head -n 1)
+          if [ -z "$BIN_NAME" ]; then BIN_NAME="candyconnect"; fi
+
+          ln -s "/opt/${APP_NAME}/${BIN_NAME}" "${PKG_DIR}/usr/bin/candyconnect"
+
+          ICON_FILE=$(find . -name "*icon*.png" -not -path "*/.*" -not -path "*/build/*" | head -n 1)
+          if [ -n "$ICON_FILE" ]; then
+            cp "$ICON_FILE" "${PKG_DIR}/usr/share/pixmaps/candyconnect.png"
+          fi
+
+          cat <<EOF > "${PKG_DIR}/usr/share/applications/candyconnect.desktop"
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=CandyConnect
+          Comment=Fast & Secure Cross-Platform Proxy Client
+          Exec=/opt/${APP_NAME}/${BIN_NAME} %U
+          Icon=candyconnect
+          Terminal=false
+          Categories=Network;Security;VPN;
+          StartupNotify=true
+          EOF
+
+          cat <<'EOF' > "${PKG_DIR}/DEBIAN/postinst"
+          #!/bin/sh
+          set -e
+          chmod +x /opt/CandyConnect/* 2>/dev/null || true
+
+          if which update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications || true
+          fi
+
+          for USER_DIR in /home/*; do
+            if [ -d "$USER_DIR/Desktop" ]; then
+              cp -f /usr/share/applications/candyconnect.desktop "$USER_DIR/Desktop/"
+              USER_NAME=$(basename "$USER_DIR")
+              chown "$USER_NAME:$USER_NAME" "$USER_DIR/Desktop/candyconnect.desktop"
+              chmod +x "$USER_DIR/Desktop/candyconnect.desktop"
+              sudo -u "$USER_NAME" gio set "$USER_DIR/Desktop/candyconnect.desktop" metadata::trusted true 2>/dev/null || true
+            fi
+          done
+
+          mkdir -p /etc/skel/Desktop
+          cp -f /usr/share/applications/candyconnect.desktop /etc/skel/Desktop/ 2>/dev/null || true
+          exit 0
+          EOF
+          chmod 755 "${PKG_DIR}/DEBIAN/postinst"
+
+          cat <<EOF > "${PKG_DIR}/DEBIAN/control"
+          Package: candyconnect
+          Version: ${DEB_VERSION}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: CandyConnect <info@candyconnect.online>
+          Depends: libgtk-3-0, libayatana-appindicator3-1 | libappindicator3-1, libkeybinder-3.0-0, libsecret-1-0
+          Description: CandyConnect Proxy Client
+           Cross-platform secure VPN and tunneling application.
+          EOF
+
+          dpkg-deb --build "${PKG_DIR}" "dist/${APP_NAME}-${VERSION}-ubuntu-linux-amd64.deb"
+
+      - name: Package Generic Linux Tarball (With Desktop Installer Script)
+        run: |
+          TAR_DIR="dist_tar/CandyConnect"
+          mkdir -p "${TAR_DIR}"
+          cp -r build/linux/x64/release/bundle/* "${TAR_DIR}/"
+
+          BIN_NAME=$(find build/linux/x64/release/bundle -maxdepth 1 -type f -executable -printf "%f\n" | head -n 1)
+          if [ -z "$BIN_NAME" ]; then BIN_NAME="candyconnect"; fi
+
+          ICON_FILE=$(find . -name "*icon*.png" -not -path "*/.*" -not -path "*/build/*" | head -n 1)
+          if [ -n "$ICON_FILE" ]; then
+            cp "$ICON_FILE" "${TAR_DIR}/icon.png"
+          fi
+
+          cat <<EOF > "${TAR_DIR}/install.sh"
+          #!/bin/bash
+          set -e
+          APP_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          DESKTOP_DIR="\${XDG_DESKTOP_DIR:-\$HOME/Desktop}"
+          APPS_DIR="\$HOME/.local/share/applications"
+
+          mkdir -p "\$APPS_DIR"
+          mkdir -p "\$DESKTOP_DIR"
+
+          DESKTOP_FILE="\$APPS_DIR/candyconnect.desktop"
+          cat <<ENTRY > "\$DESKTOP_FILE"
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=CandyConnect
+          Exec=\$APP_DIR/${BIN_NAME} %U
+          Icon=\$APP_DIR/icon.png
+          Terminal=false
+          Categories=Network;Security;VPN;
+          StartupNotify=true
+          ENTRY
+
+          chmod +x "\$DESKTOP_FILE"
+          cp -f "\$DESKTOP_FILE" "\$DESKTOP_DIR/"
+          chmod +x "\$DESKTOP_DIR/candyconnect.desktop"
+          gio set "\$DESKTOP_DIR/candyconnect.desktop" metadata::trusted true 2>/dev/null || true
+
+          echo "CandyConnect installed successfully with Desktop Shortcut created!"
+          EOF
+          chmod +x "${TAR_DIR}/install.sh"
+
+          tar -czvf "dist/${APP_NAME}-${VERSION}-linux-x64.tar.gz" -C dist_tar CandyConnect
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+
+  # ==========================================
+  # 3. ANDROID BUILD (WITH LEGACY PLUGIN PATCHER)
+  # ==========================================
+  build-android:
+    name: Build Android (APKs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set Version Variable
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Patch Legacy Android Plugins (jcenter & device_apps)
+        run: |
+          # ۱. جایگزینی مخزن حذف‌شده jcenter() با mavenCentral() در تمام پکیج‌های کش‌شده
+          find "$HOME/.pub-cache" -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) \
+            -exec sed -i 's/jcenter()/mavenCentral()/g' {} +
+
+          # ۲. اصلاح ساختار پکیج قدیمی device_apps برای سازگاری با AGP 8+ و Java 17
+          DEVICE_APPS_GRADLE=$(find "$HOME/.pub-cache" -path "*/device_apps*/android/build.gradle" | head -n 1)
+          if [ -n "$DEVICE_APPS_GRADLE" ]; then
+            echo "Patching $DEVICE_APPS_GRADLE..."
+            # ارتقای compileSdkVersion به 35
+            sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 35/g' "$DEVICE_APPS_GRADLE"
+
+            # تزریق namespace و هماهنگ‌سازی JVM Target با Java 17 در صورتی که قبلاً اضافه نشده باشد
+            if ! grep -q "namespace" "$DEVICE_APPS_GRADLE"; then
+              sed -i 's/android {/android {\n    namespace "fr.g123k.deviceapps"\n    compileOptions {\n        sourceCompatibility JavaVersion.VERSION_17\n        targetCompatibility JavaVersion.VERSION_17\n    }\n    kotlinOptions {\n        jvmTarget = "17"\n    }/g' "$DEVICE_APPS_GRADLE"
+            fi
+          fi
+
+          # ۳. حذف صفت قدیمی package از AndroidManifest.xml پکیج device_apps
+          DEVICE_APPS_MANIFEST=$(find "$HOME/.pub-cache" -path "*/device_apps*/android/src/main/AndroidManifest.xml" | head -n 1)
+          if [ -n "$DEVICE_APPS_MANIFEST" ]; then
+            echo "Patching $DEVICE_APPS_MANIFEST..."
+            sed -i 's/package="fr.g123k.deviceapps"//g' "$DEVICE_APPS_MANIFEST"
+          fi
+
+      - name: Build Split & Universal APKs
+        run: |
+          flutter build apk --release --split-per-abi --android-skip-build-dependency-validation
+          flutter build apk --release --android-skip-build-dependency-validation
+
+      - name: Prepare Android Artifacts
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "dist/${APP_NAME}-${VERSION}-android-arm64-v8a.apk" || true
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "dist/${APP_NAME}-${VERSION}-android-armeabi-v7a.apk" || true
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk "dist/${APP_NAME}-${VERSION}-android-x86_64.apk" || true
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/${APP_NAME}-${VERSION}-android-universal.apk"
+
+      - name: Upload Android Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release
+          path: dist/*.apk
+
+  # ==========================================
+  # 4. MACOS BUILD (FAST SHALLOW CLONE)
+  # ==========================================
+  build-macos:
+    name: Build macOS (.dmg)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set Version Variable
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Flutter via Fast Shallow Clone
+        run: |
+          git clone --depth 1 -b ${{ env.FLUTTER_VERSION }} https://github.com/flutter/flutter.git $HOME/flutter
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          echo "$HOME/flutter/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
+
+      - name: Build macOS Release
+        run: |
+          flutter config --enable-macos-desktop
+          flutter pub get
+          flutter build macos --release
+
+      - name: Create macOS DMG
+        run: |
+          mkdir -p dist dmg_staging
+          cp -r build/macos/Build/Products/Release/*.app dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname "${APP_NAME}" -srcfolder dmg_staging -ov -format UDZO "dist/${APP_NAME}-${VERSION}-macos-universal.dmg"
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: dist/*.dmg
+
+  # ==========================================
+  # 5. IOS BUILD (FAST SHALLOW CLONE & UNSIGNED IPA)
+  # ==========================================
+  build-ios:
+    name: Build iOS (Unsigned IPA)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Set Version Variable
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Flutter via Fast Shallow Clone
+        run: |
+          git clone --depth 1 -b ${{ env.FLUTTER_VERSION }} https://github.com/flutter/flutter.git $HOME/flutter
+          echo "$HOME/flutter/bin" >> $GITHUB_PATH
+          echo "$HOME/flutter/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
+
+      - name: Build iOS App Bundle
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p dist Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r "dist/${APP_NAME}-${VERSION}-ios-unsigned.ipa" Payload
+
+      - name: Upload iOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release
+          path: dist/*.ipa
+
+  # ==========================================
+  # 6. PUBLISH ALL PLATFORMS TO GITHUB RELEASE
+  # ==========================================
+  publish-release:
+    name: Publish Release Assets
+    needs: [build-windows, build-linux, build-android, build-macos, build-ios]
+    if: |
+      always() && (
+        needs.build-windows.result == 'success' ||
+        needs.build-linux.result == 'success' ||
+        needs.build-android.result == 'success' ||
+        needs.build-macos.result == 'success' ||
+        needs.build-ios.result == 'success'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Version Variable
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Generate Checksums
+        working-directory: release_assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "CandyConnect ${{ env.VERSION }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: release_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
