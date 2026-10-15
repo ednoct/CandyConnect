@@ -5,7 +5,7 @@ import '../models/remote_config.dart';
 class RemoteConfigService {
   static const String _configUrl = 'https://api.github.com/repos/ednoct/private/contents/config.json?ref=main';
   // Keep the token as user requested
-  static const String _githubToken = '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'; 
+  static const String _githubToken = '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'; 
 
   Future<RemoteConfig?> fetchConfig() async {
     try {
