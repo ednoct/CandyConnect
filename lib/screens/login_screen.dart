@@ -1,10 +1,11 @@
+import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:screen_capturer/screen_capturer.dart';
-import 'package:zxing2/qrcode.dart';
-import 'package:image/image.dart' as img;
+import 'package:shared_preferences/shared_preferences.dart';
+
 import '../providers/app_providers.dart';
 import '../widgets/glass_card.dart';
 import '../widgets/animated_wave_background.dart';
@@ -14,7 +15,6 @@ import '../services/subscription_service.dart';
 import '../utils/url_launcher_utils.dart';
 import 'home_screen.dart';
 import 'mobile_qr_scanner.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 class LoginScreen extends ConsumerStatefulWidget {
   const LoginScreen({super.key});
@@ -25,59 +25,117 @@ class LoginScreen extends ConsumerStatefulWidget {
 
 class _LoginScreenState extends ConsumerState<LoginScreen> {
   final TextEditingController _licenseController = TextEditingController();
+
   bool _isLoading = false;
+  bool _isInvalidLicense = false;
   String? _errorMessage;
+
+  @override
+  void dispose() {
+    _licenseController.dispose();
+    super.dispose();
+  }
 
   Future<void> _login() async {
     final license = _licenseController.text.trim();
-    if (license.isEmpty) return;
+    if (license.isEmpty) {
+      setState(() {
+        _errorMessage = 'لطفاً کلید لایسنس خود را وارد یا اسکن کنید.';
+        _isInvalidLicense = false;
+      });
+      return;
+    }
+
+    FocusScope.of(context).unfocus();
+    HapticFeedback.lightImpact();
 
     setState(() {
       _isLoading = true;
       _errorMessage = null;
+      _isInvalidLicense = false;
     });
 
     try {
       final config = await RemoteConfigService().fetchConfig();
       if (config == null) {
-        setState(() {
-          _errorMessage = "خطا در دریافت تنظیمات سرور دوباره امتحان کنید";
-        });
+        if (mounted) {
+          setState(() {
+            _errorMessage = 'خطا در دریافت تنظیمات سرور؛ لطفاً دوباره تلاش کنید.';
+          });
+        }
         return;
       }
-      ref.read(remoteConfigProvider.notifier).state = config;
+      ref.read(remoteConfigProvider.notifier).set(config);
 
       final subService = SubscriptionService(
         config.apiEndpoints.baseJsonSubUrl,
-        config.apiEndpoints.baseSubsStatsUrl.isNotEmpty ? config.apiEndpoints.baseSubsStatsUrl.first : '',
+        config.apiEndpoints.baseSubsStatsUrl.isNotEmpty
+            ? config.apiEndpoints.baseSubsStatsUrl.first
+            : '',
+        failoverSubUrls: config.apiEndpoints.failoverApiUrls,
+        failoverStatsUrls: config.apiEndpoints.baseSubsStatsUrl.length > 1
+            ? config.apiEndpoints.baseSubsStatsUrl.sublist(1)
+            : const [],
       );
 
-      final subscription = await subService.fetchSubscription(license);
+      List<dynamic>? subscription =
+          await subService.fetchSubscription(license);
+
+      // پشتیبانی اضطراری در صورت فیلتر بودن تمام دامنه‌های اشتراک
+      if (subscription == null &&
+          config.emergencyAccess.enableHardcodedFallback &&
+          config.emergencyAccess.fallbackNodes.isNotEmpty) {
+        final fallbackList = <dynamic>[];
+        for (final raw in config.emergencyAccess.fallbackNodes) {
+          try {
+            final parsed = jsonDecode(raw);
+            if (parsed is Map) fallbackList.add(parsed);
+          } catch (_) {
+            fallbackList.add({'address': raw, 'port': 443});
+          }
+        }
+        if (fallbackList.isNotEmpty) {
+          subscription = fallbackList;
+        }
+      }
+
       if (subscription != null) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('license_key', license);
-        
-        ref.read(currentLicenseProvider.notifier).state = license;
-        ref.read(subscriptionJsonProvider.notifier).state = subscription;
+
+        // پاکسازی استیت‌های قبلی و مقداردهی اکانت جدید
+        ref.read(subscriptionStatsProvider.notifier).set(null);
+        ref.read(isPromoDismissedProvider.notifier).set(false);
+        ref.read(currentLicenseProvider.notifier).set(license);
+        ref.read(subscriptionJsonProvider.notifier).set(subscription);
+        ref.read(navIndexProvider.notifier).set(0);
+
         if (!mounted) return;
-        ref.read(navIndexProvider.notifier).state = 0;
-        Navigator.pushReplacement(
+        Navigator.pushAndRemoveUntil(
           context,
           MaterialPageRoute(builder: (_) => const MainScreen()),
+          (route) => false,
         );
       } else {
-        setState(() {
-          _errorMessage = "خطا در اتصال اولیه دوباره امتحان کنید!";
-        });
+        if (mounted) {
+          setState(() {
+            _errorMessage = 'خطا در اتصال اولیه؛ لطفاً دوباره امتحان کنید!';
+          });
+        }
       }
     } on InvalidLicenseException catch (e) {
-      setState(() {
-        _errorMessage = e.message;
-      });
+      if (mounted) {
+        setState(() {
+          _errorMessage = e.message;
+          _isInvalidLicense = true;
+        });
+      }
     } catch (e) {
-      setState(() {
-        _errorMessage = "خطا در اتصال اولیه به سرور دوباره امتحان کنید!";
-      });
+      if (mounted) {
+        setState(() {
+          _errorMessage = 'خطا در برقراری ارتباط با سرور؛ لطفاً دوباره تلاش کنید!';
+        });
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -87,37 +145,60 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     }
   }
 
+  /// جایگذاری سریع متن لایسنس از کلیپ‌بورد
+  Future<void> _pasteFromClipboard() async {
+    HapticFeedback.selectionClick();
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim() ?? '';
+    if (text.isNotEmpty && mounted) {
+      setState(() {
+        _licenseController.text = text;
+        _errorMessage = null;
+        _isInvalidLicense = false;
+      });
+    }
+  }
+
+  /// اسکن بارکد (در دسکتاپ از روی صفحه نمایش، در موبایل با دوربین)
   Future<void> _handleQRScan() async {
+    HapticFeedback.lightImpact();
     if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
       try {
-        CapturedData? capturedData = await screenCapturer.capture(
+        final CapturedData? capturedData = await screenCapturer.capture(
           mode: CaptureMode.region,
         );
         if (capturedData != null && capturedData.imageBytes != null) {
-          final image = img.decodeImage(capturedData.imageBytes!);
-          if (image != null) {
-            final pixels = Int32List(image.width * image.height);
-            for (int y = 0; y < image.height; y++) {
-              for (int x = 0; x < image.width; x++) {
-                final p = image.getPixel(x, y);
-                final r = p.r.toInt();
-                final g = p.g.toInt();
-                final b = p.b.toInt();
-                pixels[y * image.width + x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-              }
-            }
-            final source = RGBLuminanceSource(image.width, image.height, pixels);
-            final bitmap = BinaryBitmap(HybridBinarizer(source));
-            final reader = QRCodeReader();
-            final result = reader.decode(bitmap);
+          setState(() {
+            _isLoading = true;
+            _errorMessage = null;
+          });
+
+          final decodedText =
+              await decodeQrFromBytesIsolate(capturedData.imageBytes!);
+
+          if (!mounted) return;
+
+          if (decodedText != null && decodedText.isNotEmpty) {
             setState(() {
-              _licenseController.text = result.text;
+              _licenseController.text = decodedText;
+              _isLoading = false;
+            });
+            await _login();
+          } else {
+            setState(() {
+              _isLoading = false;
+              _errorMessage = 'بارکدی در ناحیه انتخاب‌شده تشخیص داده نشد.';
             });
           }
-
         }
       } catch (e) {
-        debugPrint('QR Scan error: $e');
+        debugPrint('Desktop QR Scan error: $e');
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _errorMessage = 'خطا در اسکن صفحه نمایش.';
+          });
+        }
       }
     } else if (Platform.isAndroid || Platform.isIOS) {
       final scannedCode = await Navigator.push<String>(
@@ -125,134 +206,258 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
         MaterialPageRoute(builder: (_) => const MobileQRScannerScreen()),
       );
 
-      if (scannedCode != null && scannedCode.isNotEmpty) {
+      if (scannedCode != null && scannedCode.isNotEmpty && mounted) {
         setState(() {
-          _licenseController.text = scannedCode;
+          _licenseController.text = scannedCode.trim();
+          _errorMessage = null;
+          _isInvalidLicense = false;
         });
+        await _login();
       }
     }
   }
 
   void _openTelegramSupport() {
-    UrlLauncherUtils.launchTelegramSupport(); // Using existing util if it points to CandyConnectbot, or directly:
-    // launchUrl(Uri.parse('tg://resolve?domain=CandyConnectbot'));
+    HapticFeedback.lightImpact();
+    UrlLauncherUtils.launchTelegramSupport();
   }
 
   @override
   Widget build(BuildContext context) {
-    final bool hasError = _errorMessage != null && _errorMessage!.contains("لایسنس شما نامعتبر است");
+    final bool isMobile = Platform.isAndroid || Platform.isIOS;
 
     return Scaffold(
       body: Stack(
         children: [
           const AnimatedWaveBackground(),
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24.0),
-              child: GlassCard(
-                height: 480,
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      'کندی کانکت',
-                      style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                            color: AppTheme.neonCyan,
-                            fontFamily: 'Vazirmatn',
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              const Shadow(color: AppTheme.neonCyan, blurRadius: 10)
-                            ],
-                          ),
-                    ),
-                    const SizedBox(height: 40),
-                    if (_errorMessage != null)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 16.0),
-                        child: Text(
-                          _errorMessage!,
-                          style: const TextStyle(color: AppTheme.errorRed, fontSize: 14),
-                          textAlign: TextAlign.center,
-                        ),
-                      ),
-                    if (!hasError) ...[
-                      TextField(
-                        controller: _licenseController,
-                        decoration: InputDecoration(
-                          labelText: 'لایسنس خود را وارد کنید',
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          suffixIcon: IconButton(
-                            icon: const Icon(Icons.qr_code_scanner),
-                            onPressed: _handleQRScan,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 30),
-                      ElevatedButton(
-                        onPressed: _isLoading ? null : _login,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppTheme.neonPurple,
-                          minimumSize: const Size(double.infinity, 50),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                        ),
-                        child: _isLoading
-                            ? const CircularProgressIndicator(color: Colors.white)
-                            : const Text('ورود', style: TextStyle(fontSize: 18, color: Colors.white)),
-                      ),
-                      const SizedBox(height: 16),
-                      ElevatedButton(
-                        onPressed: _openTelegramSupport,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blueAccent,
-                          minimumSize: const Size(double.infinity, 50),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                        ),
-                        child: const Text('خرید لایسنس', style: TextStyle(fontSize: 18, color: Colors.white)),
-                      ),
-                    ] else ...[
-                      Row(
-                        children: [
-                          Expanded(
-                            child: ElevatedButton(
-                              onPressed: _openTelegramSupport,
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.blueAccent,
-                                minimumSize: const Size(double.infinity, 50),
+          SafeArea(
+            child: Center(
+              child: SingleChildScrollView(
+                physics: const BouncingScrollPhysics(),
+                padding: const EdgeInsets.all(24.0),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 440),
+                  child: GlassCard(
+                    height: 500,
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          'کندی کانکت',
+                          style: Theme.of(context)
+                              .textTheme
+                              .headlineMedium
+                              ?.copyWith(
+                                color: AppTheme.neonCyan,
+                                fontFamily: 'Vazirmatn',
+                                fontWeight: FontWeight.bold,
+                                shadows: const [
+                                  Shadow(
+                                    color: AppTheme.neonCyan,
+                                    blurRadius: 12,
+                                  )
+                                ],
                               ),
-                              child: const Text('خرید لایسنس', style: TextStyle(color: Colors.white)),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'نسل جدید ارتباط امن و پایدار',
+                          style: TextStyle(
+                            color: Colors.white54,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+
+                        if (_errorMessage != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 16.0),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: AppTheme.errorRed.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color:
+                                      AppTheme.errorRed.withValues(alpha: 0.4),
+                                ),
+                              ),
+                              child: Text(
+                                _errorMessage!,
+                                style: const TextStyle(
+                                  color: AppTheme.errorRed,
+                                  fontSize: 13,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
                             ),
                           ),
-                          const SizedBox(width: 16),
-                          Expanded(
-                            child: ElevatedButton(
-                              onPressed: _openTelegramSupport,
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.grey[800],
-                                minimumSize: const Size(double.infinity, 50),
+
+                        if (!_isInvalidLicense) ...[
+                          TextField(
+                            controller: _licenseController,
+                            enabled: !_isLoading,
+                            textInputAction: TextInputAction.done,
+                            onSubmitted: (_) => _login(),
+                            style: const TextStyle(color: Colors.white),
+                            decoration: InputDecoration(
+                              labelText: 'لایسنس خود را وارد کنید',
+                              labelStyle:
+                                  const TextStyle(color: Colors.white70),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
                               ),
-                              child: const Text('پشتیبانی', style: TextStyle(color: Colors.white)),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide:
+                                    const BorderSide(color: Colors.white24),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: const BorderSide(
+                                    color: AppTheme.neonCyan, width: 1.5),
+                              ),
+                              suffixIcon: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    tooltip: 'جایگذاری از کلیپ‌بورد',
+                                    icon: const Icon(
+                                      Icons.content_paste_rounded,
+                                      color: Colors.white70,
+                                      size: 20,
+                                    ),
+                                    onPressed:
+                                        _isLoading ? null : _pasteFromClipboard,
+                                  ),
+                                  IconButton(
+                                    tooltip: isMobile
+                                        ? 'اسکن بارکد با دوربین'
+                                        : 'اسکن بارکد از صفحه نمایش',
+                                    icon: const Icon(
+                                      Icons.qr_code_scanner_rounded,
+                                      color: AppTheme.neonCyan,
+                                    ),
+                                    onPressed:
+                                        _isLoading ? null : _handleQRScan,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 28),
+                          ElevatedButton(
+                            onPressed: _isLoading ? null : _login,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppTheme.neonPurple,
+                              minimumSize: const Size(double.infinity, 52),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            child: _isLoading
+                                ? const SizedBox(
+                                    width: 24,
+                                    height: 24,
+                                    child: CircularProgressIndicator(
+                                      color: Colors.white,
+                                      strokeWidth: 2.5,
+                                    ),
+                                  )
+                                : const Text(
+                                    'ورود به اشتراک',
+                                    style: TextStyle(
+                                      fontSize: 17,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                          ),
+                          const SizedBox(height: 14),
+                          ElevatedButton.icon(
+                            onPressed: _openTelegramSupport,
+                            icon: const Icon(
+                              Icons.shopping_cart_checkout_rounded,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blueAccent,
+                              minimumSize: const Size(double.infinity, 50),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            label: const Text(
+                              'خرید لایسنس جدید',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ] else ...[
+                          Row(
+                            children: [
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: _openTelegramSupport,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.blueAccent,
+                                    minimumSize:
+                                        const Size(double.infinity, 50),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                  ),
+                                  child: const Text(
+                                    'خرید لایسنس',
+                                    style: TextStyle(color: Colors.white),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 16),
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: _openTelegramSupport,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.grey[800],
+                                    minimumSize:
+                                        const Size(double.infinity, 50),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                  ),
+                                  child: const Text(
+                                    'پشتیبانی',
+                                    style: TextStyle(color: Colors.white),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 20),
+                          TextButton.icon(
+                            onPressed: () {
+                              setState(() {
+                                _errorMessage = null;
+                                _isInvalidLicense = false;
+                                _licenseController.clear();
+                              });
+                            },
+                            icon: const Icon(Icons.arrow_back_rounded,
+                                color: Colors.white70, size: 18),
+                            label: const Text(
+                              'تلاش مجدد با لایسنس دیگر',
+                              style: TextStyle(color: Colors.white70),
                             ),
                           ),
                         ],
-                      ),
-                      const SizedBox(height: 20),
-                      TextButton(
-                        onPressed: () {
-                          setState(() {
-                            _errorMessage = null;
-                            _licenseController.clear();
-                          });
-                        },
-                        child: const Text('بازگشت', style: TextStyle(color: Colors.white70)),
-                      ),
-                    ],
-                  ],
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),

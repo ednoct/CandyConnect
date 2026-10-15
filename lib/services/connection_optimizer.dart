@@ -7,25 +7,10 @@ import 'package:flutter/foundation.dart';
 import '../core/xray_bridge.dart';
 import 'dns_manager.dart';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Result type returned by the optimizer
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The winning combination of node + DNS architecture selected by the
-/// [ConnectionOptimizer]'s real-delay HTTP benchmark.
 class OptimizedResult {
-  /// The subscription node that won the benchmark.
   final Map<String, dynamic> node;
-
-  /// The Bootstrap DNS IP (to be routed *direct* / outside the proxy),
-  /// chosen by [DnsManager.raceBestBootstrap].
   final String bootstrapDns;
-
-  /// The Remote DNS IP (to be routed *through* the proxy), chosen as
-  /// part of the variant that produced the fastest HTTP response.
   final String remoteDns;
-
-  /// Elapsed milliseconds for the winning HTTP GET through the proxy.
   final int realDelayMs;
 
   const OptimizedResult({
@@ -44,26 +29,17 @@ class OptimizedResult {
       ')';
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Benchmark Isolate entry-point  (MUST be a top-level function)
-// ─────────────────────────────────────────────────────────────────────────────
+class _BoundVariant {
+  final NodeVariant variant;
+  final int port;
+  const _BoundVariant({required this.variant, required this.port});
+}
 
-/// Entry-point for the short-lived benchmark Xray isolate.
-///
-/// The `runXray` CGo call is **blocking** — it runs the full Xray event loop
-/// until `stopXray` is invoked from another context (main isolate) or the
-/// isolate is killed.  Running it here keeps the main/UI thread completely
-/// free during the benchmark.
-///
-/// Receives: `[SendPort replyPort, String configFilePath]`
 void _benchmarkIsolateEntry(List<dynamic> args) {
   final sendPort = args[0] as SendPort;
   final configPath = args[1] as String;
 
   try {
-    // XrayBridge re-initialises its static state within this isolate
-    // (each isolate has its own heap). The underlying Go DLL and its state
-    // are process-global, so this call drives the same singleton Xray engine.
     final result = XrayBridge.invoke(jsonEncode({
       'apiVersion': 1,
       'method': 'runXray',
@@ -75,65 +51,20 @@ void _benchmarkIsolateEntry(List<dynamic> args) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ConnectionOptimizer
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Performs real-delay (HTTP Proxy Head Ping) benchmarking of [NodeVariant]s.
-///
-/// ### Mechanism
-/// 1. Builds a **single** temporary Xray JSON config containing:
-///    - One HTTP inbound per variant (on ports [_benchBasePort] + i)
-///    - One proxy outbound per variant (cloned from the node's outbound block)
-///    - Routing: `bench-in-i → bench-out-i`
-/// 2. Spins this config up inside a **dedicated Dart Isolate**.
-///    The `runXray` call blocks that isolate's thread — the main isolate
-///    is never stalled.
-/// 3. Fires concurrent `HttpClient` GET requests to [probeUrl] through each
-///    variant's HTTP proxy port using `HttpClient.findProxy`.
-/// 4. The first variant returning an HTTP 2xx wins.
-/// 5. Sends `stopXray` to the Go DLL, then kills the isolate cleanly.
-///
-/// ### Cancellation
-/// Call [cancel] at any time (e.g. user taps Disconnect). The `_cancelled`
-/// flag is set synchronously, so probes that have not yet fired are skipped
-/// immediately. The benchmark Xray is stopped async in the background.
 class ConnectionOptimizer {
-  // ── Configuration constants ───────────────────────────────────────────────
-
-  /// Base local port for benchmark HTTP inbounds.  Variants occupy a contiguous
-  /// range: [_benchBasePort, _benchBasePort + concurrency − 1].
   static const int _benchBasePort = 12100;
+  static int _runCounter = 0;
+  static const Duration _xrayWarmup = Duration(milliseconds: 1200);
+  static const int _probeTimeoutMs = 5500;
 
-  /// Seconds to wait after spawning the Xray isolate before firing probes.
-  /// Xray needs a moment to bind its listeners.
-  static const Duration _xrayWarmup = Duration(milliseconds: 1500);
-
-  /// Total HTTP probe timeout per variant, in milliseconds.
-  static const int _probeTimeoutMs = 6000;
-
-  // ── Internal state ────────────────────────────────────────────────────────
-
+  final Set<HttpClient> _activeClients = {};
   Isolate? _benchmarkIsolate;
   ReceivePort? _benchmarkPort;
   File? _configFile;
   bool _cancelled = false;
 
-  // ── Public API ────────────────────────────────────────────────────────────
-
-  /// Resets the cancellation flag so this instance can be reused after [cancel].
   void reset() => _cancelled = false;
 
-  /// Finds the best [NodeVariant] via real HTTP delay through a temporary
-  /// Xray proxy instance.
-  ///
-  /// Returns `null` if:
-  ///   - [variants] is empty
-  ///   - No variant responds successfully within the timeout
-  ///   - [cancel] was called before the result arrived
-  ///
-  /// The [probeUrl] should be a lightweight endpoint that returns HTTP 2xx
-  /// quickly (e.g. `https://cp.cloudflare.com/generate_204`).
   Future<OptimizedResult?> findBest({
     required List<NodeVariant> variants,
     required String bootstrapDns,
@@ -142,29 +73,30 @@ class ConnectionOptimizer {
   }) async {
     if (variants.isEmpty || _cancelled) return null;
 
-    // Cap concurrency to avoid opening too many ephemeral ports
     final limited = variants.take(concurrency).toList();
     debugPrint(
       '[ConnectionOptimizer] Starting real-delay benchmark: '
       '${limited.length} variants, probe: $probeUrl',
     );
 
+    // پورت پایه متغیر برای جلوگیری از تداخل پورت با پروسه‌های قبلی یا TIME_WAIT
+    final basePort = _benchBasePort + ((_runCounter++ % 10) * 10);
+
     // ── Step 1: Build the multi-outbound benchmark Xray config ───────────
-    final config = _buildBenchmarkConfig(limited, _benchBasePort);
-    if (config == null) {
+    final buildResult =
+        _buildBenchmarkConfig(limited, bootstrapDns, basePort);
+    if (buildResult == null || buildResult.boundVariants.isEmpty) {
       debugPrint('[ConnectionOptimizer] No parseable proxy outbounds found — '
           'skipping real-delay phase.');
       return null;
     }
 
     // ── Step 2: Persist config to a temp file ────────────────────────────
-    _configFile = await _writeTempConfig(config);
+    _configFile = await _writeTempConfig(buildResult.config);
     if (_configFile == null || _cancelled) {
       _cleanup();
       return null;
     }
-    debugPrint(
-        '[ConnectionOptimizer] Benchmark config written: ${_configFile!.path}');
 
     // ── Step 3: Spawn the blocking Xray isolate ──────────────────────────
     _benchmarkPort = ReceivePort();
@@ -184,7 +116,6 @@ class ConnectionOptimizer {
     // ── Step 4: Wait for Xray to bind its HTTP listeners ─────────────────
     await Future.delayed(_xrayWarmup);
     if (_cancelled) {
-      debugPrint('[ConnectionOptimizer] Cancelled during warmup.');
       await _stopBenchmarkCore();
       _cleanup();
       return null;
@@ -194,7 +125,9 @@ class ConnectionOptimizer {
     OptimizedResult? winner;
     try {
       winner = await _raceProbeFutures(
-        limited, bootstrapDns, probeUrl, _benchBasePort,
+        buildResult.boundVariants,
+        bootstrapDns,
+        probeUrl,
       );
     } catch (e) {
       debugPrint('[ConnectionOptimizer] Probe race threw: $e');
@@ -214,52 +147,85 @@ class ConnectionOptimizer {
     return winner;
   }
 
-  /// Aborts any in-progress benchmark.
-  ///
-  /// Sets [_cancelled] synchronously (so in-flight probes skip immediately),
-  /// then tears down the benchmark Xray + isolate in the background.
-  /// This method itself is async but callers **do not need to await** it;
-  /// they may call it fire-and-forget during a disconnect sequence.
+  /// لغو فوری بنچمارک در حال اجرا و آزادسازی تمام منابع
   Future<void> cancel() async {
     if (_cancelled) return;
     _cancelled = true;
     debugPrint('[ConnectionOptimizer] cancel() invoked.');
+    for (final c in _activeClients) {
+      try {
+        c.close(force: true);
+      } catch (_) {}
+    }
+    _activeClients.clear();
     await _stopBenchmarkCore();
     _cleanup();
   }
 
+  /// نسخه همزمان (Sync) برای فراخوانی از dispose — بدون انتظار برای توقف ایزوله
+  void cancelSync() {
+    if (_cancelled) return;
+    _cancelled = true;
+    for (final c in _activeClients) {
+      try {
+        c.close(force: true);
+      } catch (_) {}
+    }
+    _activeClients.clear();
+    _benchmarkIsolate?.kill(priority: Isolate.immediate);
+    _benchmarkIsolate = null;
+    _benchmarkPort?.close();
+    _benchmarkPort = null;
+    try {
+      XrayBridge.invoke(jsonEncode({
+        'apiVersion': 1,
+        'method': 'stopXray',
+        'payload': {},
+      }));
+    } catch (_) {}
+    try {
+      if (_configFile != null && _configFile!.existsSync()) {
+        _configFile!.deleteSync();
+      }
+    } catch (_) {}
+    _configFile = null;
+  }
+
+
   // ── Private: Config Building ──────────────────────────────────────────────
 
-  /// Builds a single temporary Xray config with N HTTP inbounds and N
-  /// proxy outbounds — one for each variant.  Returns `null` if no valid
-  /// proxy outbounds could be extracted from any node.
-  Map<String, dynamic>? _buildBenchmarkConfig(
+  ({Map<String, dynamic> config, List<_BoundVariant> boundVariants})?
+      _buildBenchmarkConfig(
     List<NodeVariant> variants,
+    String bootstrapDns,
     int basePort,
   ) {
     final inbounds = <Map<String, dynamic>>[];
     final outbounds = <Map<String, dynamic>>[];
     final rules = <Map<String, dynamic>>[];
+    final boundVariants = <_BoundVariant>[];
+    final dnsServers = <dynamic>[bootstrapDns];
 
     for (int i = 0; i < variants.length; i++) {
       final variant = variants[i];
-      final outboundTag = 'bench-out-$i';
-      final inboundTag = 'bench-in-$i';
-      final port = basePort + i;
+      final slotIdx = boundVariants.length;
+      final outboundTag = 'bench-out-$slotIdx';
+      final inboundTag = 'bench-in-$slotIdx';
+      final port = basePort + slotIdx;
 
-      // Extract and retag the node's proxy outbound
       final proxyOutbound =
           _extractProxyOutbound(variant.node, outboundTag);
       if (proxyOutbound == null) {
-        debugPrint(
-            '[ConnectionOptimizer] Variant $i: could not extract proxy '
-            'outbound — skipping.');
         continue;
       }
 
-      outbounds.add(proxyOutbound);
+      if (!dnsServers.contains(variant.remoteDns)) {
+        dnsServers.add(variant.remoteDns);
+      }
 
-      // HTTP inbound on a unique loopback port
+      outbounds.add(proxyOutbound);
+      boundVariants.add(_BoundVariant(variant: variant, port: port));
+
       inbounds.add({
         'tag': inboundTag,
         'protocol': 'http',
@@ -272,7 +238,6 @@ class ConnectionOptimizer {
         'sniffing': {'enabled': false},
       });
 
-      // Strict 1-to-1 routing: this inbound → this outbound only
       rules.add({
         'type': 'field',
         'inboundTag': [inboundTag],
@@ -282,25 +247,34 @@ class ConnectionOptimizer {
 
     if (outbounds.isEmpty) return null;
 
-    // Mandatory fallback outbounds required by Xray's routing engine
+    // هدایت مستقیم ترافیک Bootstrap DNS تا دامنه‌های سرور پروکسی بدون حلقه، Resolve شوند
+    rules.insert(0, {
+      'type': 'field',
+      'ip': ['$bootstrapDns/32'],
+      'outboundTag': 'direct',
+    });
+
     outbounds.addAll([
       {'tag': 'direct', 'protocol': 'freedom', 'settings': {}},
       {'tag': 'block', 'protocol': 'blackhole', 'settings': {}},
     ]);
 
-    return {
+    final config = <String, dynamic>{
       'log': {'loglevel': 'none'},
+      'dns': {
+        'servers': dnsServers,
+      },
       'inbounds': inbounds,
       'outbounds': outbounds,
       'routing': {
-        'domainStrategy': 'AsIs',
+        'domainStrategy': 'IPIfNonMatch',
         'rules': rules,
       },
     };
+
+    return (config: config, boundVariants: boundVariants);
   }
 
-  /// Clones the first non-direct / non-block outbound from [node], applying
-  /// [newTag].  Returns `null` if no suitable outbound is found.
   Map<String, dynamic>? _extractProxyOutbound(
     Map<String, dynamic> node,
     String newTag,
@@ -310,26 +284,25 @@ class ConnectionOptimizer {
 
     for (final ob in rawOutbounds) {
       if (ob is! Map) continue;
-      final obMap = Map<String, dynamic>.from(ob);
+      final obMap = Map<String, dynamic>.from(
+        jsonDecode(jsonEncode(ob)) as Map,
+      );
       final tag = (obMap['tag'] as String? ?? '').toLowerCase();
-      // Skip special system outbounds
       if (tag == 'direct' || tag == 'block' || tag == 'dns-out') continue;
 
-      // Retag and return the cloned outbound
       obMap['tag'] = newTag;
       return obMap;
     }
     return null;
   }
 
-  /// Writes [config] to a uniquely-named temp file.  Returns `null` on error.
   Future<File?> _writeTempConfig(Map<String, dynamic> config) async {
     try {
       final tempDir = Directory.systemTemp;
       final file = File(
-        '${tempDir.path}/cc_bench_${DateTime.now().millisecondsSinceEpoch}.json',
+        '${tempDir.path}/cc_bench_${DateTime.now().microsecondsSinceEpoch}.json',
       );
-      await file.writeAsString(jsonEncode(config));
+      await file.writeAsString(jsonEncode(config), flush: true);
       return file;
     } catch (e) {
       debugPrint('[ConnectionOptimizer] Failed to write temp config: $e');
@@ -339,56 +312,39 @@ class ConnectionOptimizer {
 
   // ── Private: Probing ──────────────────────────────────────────────────────
 
-  /// Fires all variant probes concurrently and resolves with the first 2xx
-  /// winner, or `null` if all fail or the overall timeout elapses.
   Future<OptimizedResult?> _raceProbeFutures(
-    List<NodeVariant> variants,
+    List<_BoundVariant> boundVariants,
     String bootstrapDns,
     String probeUrl,
-    int basePort,
   ) {
-    // A Completer lets the first success signal all others to stand down.
     final completer = Completer<OptimizedResult?>();
-    int remaining = variants.length;
+    int remaining = boundVariants.length;
 
     void onProbeResult(OptimizedResult? result) {
       if (completer.isCompleted) return;
       remaining--;
       if (result != null) {
-        // First winner
         completer.complete(result);
       } else if (remaining <= 0) {
-        // All probes failed
         completer.complete(null);
       }
     }
 
-    for (int i = 0; i < variants.length; i++) {
+    for (final bound in boundVariants) {
       if (_cancelled) {
         onProbeResult(null);
         continue;
       }
-      final variant = variants[i];
-      final port = basePort + i;
-      _probeVariant(variant, bootstrapDns, port, probeUrl)
+      _probeVariant(bound.variant, bootstrapDns, bound.port, probeUrl)
           .then(onProbeResult);
     }
 
-    // Outer timeout slightly longer than per-probe to catch stragglers
     return completer.future.timeout(
       const Duration(milliseconds: _probeTimeoutMs + 1000),
       onTimeout: () => null,
     );
   }
 
-  /// Issues an HTTP GET to [probeUrl] through the HTTP proxy on [proxyPort].
-  ///
-  /// Uses `HttpClient.findProxy` which sends an HTTP `CONNECT` tunnel for
-  /// HTTPS targets — fully supported by Xray's `http` protocol inbound.
-  /// Certificate verification is disabled since we only care about
-  /// reachability timing, not content authenticity.
-  ///
-  /// Returns an [OptimizedResult] on HTTP 2xx, or `null` on failure.
   Future<OptimizedResult?> _probeVariant(
     NodeVariant variant,
     String bootstrapDns,
@@ -400,30 +356,25 @@ class ConnectionOptimizer {
     HttpClient? client;
     try {
       client = HttpClient();
+      _activeClients.add(client);
       client.connectionTimeout =
           const Duration(milliseconds: _probeTimeoutMs);
       client.idleTimeout = const Duration(seconds: 2);
-
-      // Route through this variant's dedicated benchmark HTTP inbound
       client.findProxy = (uri) => 'PROXY 127.0.0.1:$proxyPort';
-
-      // Bypass TLS certificate verification — we are measuring speed, not
-      // validating server identity during the benchmark pass.
       client.badCertificateCallback = (cert, host, port) => true;
 
       final request = await client
           .getUrl(Uri.parse(probeUrl))
-          .timeout(Duration(milliseconds: _probeTimeoutMs));
+          .timeout(const Duration(milliseconds: _probeTimeoutMs));
       request.headers
         ..set('User-Agent', 'CandyConnect/Optimizer 1.0')
         ..set('Connection', 'close');
 
       final response = await request
           .close()
-          .timeout(Duration(milliseconds: _probeTimeoutMs));
+          .timeout(const Duration(milliseconds: _probeTimeoutMs));
 
       sw.stop();
-      // Drain body to free the connection
       await response.drain<void>();
 
       if (_cancelled) return null;
@@ -447,10 +398,11 @@ class ConnectionOptimizer {
       );
     } catch (e) {
       sw.stop();
-      debugPrint(
-          '[ConnectionOptimizer] Port $proxyPort probe failed: $e');
       return null;
     } finally {
+      if (client != null) {
+        _activeClients.remove(client);
+      }
       try {
         client?.close(force: true);
       } catch (_) {}
@@ -459,34 +411,29 @@ class ConnectionOptimizer {
 
   // ── Private: Teardown ─────────────────────────────────────────────────────
 
-  /// Signals the Go DLL to stop the benchmark Xray event loop.
-  ///
-  /// Because [_benchmarkIsolateEntry] blocks on `runXray`, invoking `stopXray`
-  /// from *this* isolate (via the same DLL) unblocks it.  This is safe because
-  /// the Go runtime manages its own synchronisation internally.
   Future<void> _stopBenchmarkCore() async {
+    if (_benchmarkIsolate == null) return;
     try {
       XrayBridge.invoke(jsonEncode({
         'apiVersion': 1,
         'method': 'stopXray',
         'payload': {},
       }));
-      debugPrint('[ConnectionOptimizer] stopXray sent to benchmark core.');
     } catch (e) {
       debugPrint('[ConnectionOptimizer] stopXray error: $e');
     }
-    // Allow Xray's goroutines to finish tearing down before we kill the isolate
-    await Future.delayed(const Duration(milliseconds: 300));
+    await Future.delayed(const Duration(milliseconds: 250));
   }
 
-  /// Kills the benchmark isolate and frees all associated resources.
   void _cleanup() {
     _benchmarkIsolate?.kill(priority: Isolate.immediate);
     _benchmarkIsolate = null;
     _benchmarkPort?.close();
     _benchmarkPort = null;
     try {
-      _configFile?.deleteSync();
+      if (_configFile != null && _configFile!.existsSync()) {
+        _configFile!.deleteSync();
+      }
     } catch (_) {}
     _configFile = null;
   }

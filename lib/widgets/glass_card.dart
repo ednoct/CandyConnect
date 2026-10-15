@@ -8,6 +8,7 @@ class GlassCard extends StatelessWidget {
   final double borderRadius;
   final EdgeInsetsGeometry padding;
   final Color? borderColor;
+  final double blurSigma;
 
   const GlassCard({
     super.key,
@@ -17,27 +18,56 @@ class GlassCard extends StatelessWidget {
     this.borderRadius = 20.0,
     this.padding = const EdgeInsets.all(16.0),
     this.borderColor,
+    this.blurSigma = 14.0,
   });
 
   @override
   Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(borderRadius),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-        child: Container(
-          width: width,
-          height: height,
-          padding: padding,
-          decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.05),
-            borderRadius: BorderRadius.circular(borderRadius),
-            border: Border.all(
-              color: borderColor ?? Colors.white.withOpacity(0.1),
-              width: 1.5,
-            ),
+    final effectiveBorderColor =
+        borderColor ?? Colors.white.withValues(alpha: 0.13);
+
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(borderRadius),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.28),
+            blurRadius: 24,
+            spreadRadius: -2,
+            offset: const Offset(0, 10),
           ),
-          child: child,
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(borderRadius),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
+          child: Container(
+            width: width,
+            height: height,
+            padding: padding,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(borderRadius),
+              // درخشش قطری ملایم (Specular Sheen) مشابه شیشه‌های فضایی VisionOS
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.white.withValues(alpha: 0.09),
+                  Colors.white.withValues(alpha: 0.04),
+                  Colors.white.withValues(alpha: 0.02),
+                ],
+                stops: const [0.0, 0.45, 1.0],
+              ),
+              border: Border.all(
+                color: effectiveBorderColor,
+                width: 1.2,
+              ),
+            ),
+            child: child,
+          ),
         ),
       ),
     );

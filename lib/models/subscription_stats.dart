@@ -8,7 +8,7 @@ class SubscriptionStats {
   final bool isUnlimitedTime;
   final bool isExpired;
 
-  SubscriptionStats({
+  const SubscriptionStats({
     required this.remainingTrafficGB,
     required this.trafficFraction,
     required this.daysRemaining,
@@ -17,79 +17,106 @@ class SubscriptionStats {
     required this.isExpired,
   });
 
-  // ── Unit-aware byte parser ──────────────────────────────────────────────
-  // The server's `remaining` field is a pre-formatted string that may carry a
-  // unit suffix, e.g. "102.40MB", "2.5 GB", "512KB", "1.2TB".
-  // We extract the numeric part and the unit separately, then convert to GB.
-  // If no recognised unit is found we fall back to treating the value as raw
-  // bytes (the original behaviour), which keeps compatibility with any server
-  // that already sends bytes.
+  /// پارس هوشمند حجم باقیمانده با پشتیبانی از اعداد منفی، اعشاری و واحدهای مختلف
   static double _parseRemainingToGB(String raw) {
-    // Normalise: trim whitespace, uppercase for matching.
     final s = raw.trim().toUpperCase();
+    if (s.isEmpty) return 0.0;
 
-    // Extract leading number (digits + optional decimal point).
-    final numMatch = RegExp(r'[\d.]+').firstMatch(s);
+    // تشخیص علامت منفی (در صورتی که کاربر بیش از سقف مجاز مصرف کرده باشد)
+    final numMatch = RegExp(r'-?[\d.]+').firstMatch(s);
     if (numMatch == null) return 0.0;
-    final value = double.tryParse(numMatch.group(0)!) ?? 0.0;
 
-    // Determine unit from the suffix that follows the number.
+    final value = double.tryParse(numMatch.group(0)!) ?? 0.0;
+    if (value <= 0) return 0.0;
+
     final suffix = s.substring(numMatch.end).replaceAll(' ', '');
 
-    if (suffix.startsWith('TB')) return value * 1024.0;
-    if (suffix.startsWith('GB')) return value;
-    if (suffix.startsWith('MB')) return value / 1024.0;
-    if (suffix.startsWith('KB')) return value / (1024.0 * 1024.0);
-    if (suffix.startsWith('B'))  return value / (1024.0 * 1024.0 * 1024.0);
+    if (suffix.startsWith('TB') || suffix.startsWith('TIB')) {
+      return value * 1024.0;
+    }
+    if (suffix.startsWith('GB') || suffix.startsWith('GIB')) {
+      return value;
+    }
+    if (suffix.startsWith('MB') || suffix.startsWith('MIB')) {
+      return value / 1024.0;
+    }
+    if (suffix.startsWith('KB') || suffix.startsWith('KIB')) {
+      return value / (1024.0 * 1024.0);
+    }
+    if (suffix.startsWith('B')) {
+      return value / (1024.0 * 1024.0 * 1024.0);
+    }
 
-    // No unit — assume raw bytes (legacy behaviour).
+    // اگر واحدی ذکر نشده بود، بر حسب بایت خام محاسبه می‌شود
     return value / (1024.0 * 1024.0 * 1024.0);
   }
 
   factory SubscriptionStats.fromJson(String jsonString) {
     final dynamic decoded = jsonDecode(jsonString);
     final Map<String, dynamic> data =
-        decoded is Map<String, dynamic> ? decoded : {};
+        decoded is Map<String, dynamic> ? decoded : <String, dynamic>{};
+    return SubscriptionStats.fromMap(data);
+  }
 
-    // ── Traffic ────────────────────────────────────────────────────────────
-    // total_bytes is always raw bytes from the server.
+  factory SubscriptionStats.fromMap(Map<String, dynamic> data) {
+    // ── ۱. محاسبه وضعیت ترافیک ──────────────────────────────────────────────
     final double totalBytes =
         double.tryParse(data['total_bytes']?.toString() ?? '0') ?? 0.0;
-    final bool isUnlimitedTraffic = totalBytes == 0;
+    final bool isUnlimitedTraffic = totalBytes <= 0;
 
     double remainingGB = 0.0;
     double fraction = 1.0;
 
     if (!isUnlimitedTraffic) {
       final String rawRem = data['remaining']?.toString() ?? '0';
-      remainingGB = _parseRemainingToGB(rawRem);
+      remainingGB = _parseRemainingToGB(rawRem).clamp(0.0, double.infinity);
       final double totalGB = totalBytes / (1024.0 * 1024.0 * 1024.0);
-      fraction =
-          totalGB > 0 ? (remainingGB / totalGB).clamp(0.0, 1.0) : 0.0;
+      fraction = totalGB > 0 ? (remainingGB / totalGB).clamp(0.0, 1.0) : 0.0;
     }
 
-    // ── Time ──────────────────────────────────────────────────────────────
-    // Server sends raw Unix timestamp in seconds (0 = unlimited).
-    // All expiry math is done here in Dart — no JS, no <script> tag.
-    final int expireTs =
-        int.tryParse(data['expire_timestamp']?.toString() ?? '0') ?? 0;
+    // ── ۲. محاسبه وضعیت زمان و انقضا ────────────────────────────────────────
+    // پشتیبانی همزمان از اعداد صحیح، اعشاری، ثانیه، میلی‌ثانیه و اکانت‌های On-Hold (منفی در 3x-ui)
+    final double rawExpireNum =
+        double.tryParse(data['expire_timestamp']?.toString() ?? '0') ?? 0.0;
+    final int expireTs = rawExpireNum.round();
 
     final bool isUnlimitedTime = expireTs == 0;
-
     bool isExpired = false;
     int daysLeft = 0;
 
     if (!isUnlimitedTime) {
-      final DateTime expiry =
-          DateTime.fromMillisecondsSinceEpoch(expireTs * 1000);
-      final Duration diff = expiry.difference(DateTime.now());
-
-      if (diff.isNegative) {
-        isExpired = true;
+      if (expireTs < 0) {
+        // در 3x-ui تایم‌استمپ منفی یعنی اشتراک «شروع پس از اولین اتصال» است و هنوز منقضی نشده
+        final int absVal = expireTs.abs();
+        final int durationSeconds =
+            absVal > 1000000000 ? (absVal ~/ 1000) : absVal;
+        daysLeft = (durationSeconds / 86400).ceil().clamp(1, 3650);
+        isExpired = false;
       } else {
-        // ceil so a partial day still counts as 1 remaining day.
-        daysLeft = (diff.inSeconds / 86400).ceil();
+        // تشخیص خودکار ثانیه (۱۰ رقمی) در برابر میلی‌ثانیه (۱۳ رقمی)
+        final int expiryMillis =
+            expireTs > 10000000000 ? expireTs : expireTs * 1000;
+        final DateTime expiry =
+            DateTime.fromMillisecondsSinceEpoch(expiryMillis);
+        final Duration diff = expiry.difference(DateTime.now());
+
+        if (diff.isNegative) {
+          isExpired = true;
+          daysLeft = 0;
+        } else {
+          daysLeft = (diff.inSeconds / 86400).ceil();
+        }
       }
+    }
+
+    // بررسی فلگ صریح وضعیت در صورت ارسال از سمت سرور
+    final String statusFlag =
+        (data['status'] ?? '').toString().trim().toLowerCase();
+    final bool explicitlyDisabled =
+        data['enable'] == false || statusFlag == 'expired' || statusFlag == 'disabled';
+
+    if (explicitlyDisabled || (!isUnlimitedTraffic && remainingGB <= 0)) {
+      isExpired = true;
     }
 
     return SubscriptionStats(

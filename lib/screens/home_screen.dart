@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
 import '../models/remote_config.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
@@ -20,19 +22,45 @@ import '../services/dns_manager.dart';
 import '../services/connection_optimizer.dart';
 import 'settings_screen.dart';
 import 'login_screen.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import '../windows/wintun_ffi.dart';
 import '../windows/windivert_ffi.dart';
 import '../windows/elevation_utils.dart';
 
-final _wintunFFI = WintunFFI();
-final _winDivertFFI = WinDivertFFI();
+// بارگذاری تنبل (Lazy Initialization) فقط در سیستم‌عامل ویندوز جهت جلوگیری از کرش در اندروید/iOS
+WintunFFI? _wintunInstance;
+WinDivertFFI? _winDivertInstance;
+
+WintunFFI get _wintunFFI => _wintunInstance ??= WintunFFI();
+WinDivertFFI get _winDivertFFI => _winDivertInstance ??= WinDivertFFI();
+
+/// تابع کمکی سراسری برای توقف ایمن و کامل تمام لایه‌های تونل و هسته در همه پلتفرم‌ها
+Future<void> safeStopAllTunnels() async {
+  if (Platform.isWindows) {
+    try {
+      _winDivertFFI.close();
+      await _wintunFFI.cleanupRouting();
+      _wintunFFI.close();
+    } catch (_) {}
+  } else if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+    const vpnChannel = MethodChannel('candyconnect/vpn');
+    try {
+      await vpnChannel.invokeMethod('stopVpn');
+    } catch (_) {}
+  }
+  if (DesktopManager().isDesktop) {
+    try {
+      await DesktopManager().applySystemProxy(enable: false);
+    } catch (_) {}
+  }
+  try {
+    await XrayBridge.stopXray();
+  } catch (_) {}
+}
+
+Future<void> _safeStopAllTunnels() => safeStopAllTunnels();
 
 // ════════════════════════════════════════════════════════════════════════════
 // Main Screen
-// Owns the stats timer so it keeps ticking whether HomeTab or
-// _ExpirationOverlay is shown — the overlay reacts automatically via
-// subscriptionStatsProvider.
 // ════════════════════════════════════════════════════════════════════════════
 
 class MainScreen extends ConsumerStatefulWidget {
@@ -45,16 +73,18 @@ class MainScreen extends ConsumerStatefulWidget {
 
 class _MainScreenState extends ConsumerState<MainScreen> {
   Timer? _statsTimer;
+  bool _isRefreshingStats = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      // Wait up to 5 s for RemoteConfig to populate.
       for (int i = 0; i < 10; i++) {
+        if (!mounted) return;
         if (ref.read(remoteConfigProvider) != null) break;
         await Future.delayed(const Duration(milliseconds: 500));
       }
+      if (!mounted) return;
       await _fetchStats();
       _scheduleStatsTimer();
     });
@@ -69,59 +99,46 @@ class _MainScreenState extends ConsumerState<MainScreen> {
   // ── Stats fetcher ─────────────────────────────────────────────────────────
 
   Future<void> _fetchStats() async {
+    if (_isRefreshingStats) return;
+    if (mounted) setState(() => _isRefreshingStats = true);
+
     try {
       final license = ref.read(currentLicenseProvider);
       final config = ref.read(remoteConfigProvider);
 
-      debugPrint('[MainScreen._fetchStats] '
-          'license=${license != null ? '***' : 'null'} '
-          'config=${config != null} '
-          'statsUrl=${config?.apiEndpoints.baseSubsStatsUrl}');
-
-      if (license == null || config == null) {
-        debugPrint('[MainScreen._fetchStats] bailing — license or config null');
-        return;
-      }
+      if (license == null || config == null) return;
 
       final statsUrl = config.apiEndpoints.baseSubsStatsUrl.isNotEmpty
           ? config.apiEndpoints.baseSubsStatsUrl.first
           : '';
 
-      if (statsUrl.isEmpty) {
-        debugPrint('[MainScreen._fetchStats] bailing — statsUrl empty');
-        return;
-      }
+      if (statsUrl.isEmpty) return;
 
       final subService = SubscriptionService(
         config.apiEndpoints.baseJsonSubUrl,
         statsUrl,
+        // ── Bug Fix: فیلیست Failover آماری به سرویس منتقل می‌شود ──────────
+        failoverStatsUrls: config.apiEndpoints.baseSubsStatsUrl.length > 1
+            ? config.apiEndpoints.baseSubsStatsUrl.sublist(1)
+            : const [],
+        failoverSubUrls: config.apiEndpoints.failoverApiUrls,
       );
 
       final stats = await subService.fetchStats(license);
 
-      debugPrint('[MainScreen._fetchStats] result: ${stats == null
-          ? 'null (fetch/parse failed)'
-          : 'unlimitedTraffic=${stats.isUnlimitedTraffic} '
-            'unlimitedTime=${stats.isUnlimitedTime} '
-            'expired=${stats.isExpired} '
-            'remainingGB=${stats.remainingTrafficGB} '
-            'days=${stats.daysRemaining}'}');
-
       if (stats != null && mounted) {
-        ref.read(subscriptionStatsProvider.notifier).state = stats;
+        ref.read(subscriptionStatsProvider.notifier).set(stats);
       }
     } catch (e, st) {
       debugPrint('[MainScreen._fetchStats] unhandled exception: $e\n$st');
+    } finally {
+      if (mounted) setState(() => _isRefreshingStats = false);
     }
   }
 
-  // ── Stats auto-refresh timer ──────────────────────────────────────────────
-
   void _scheduleStatsTimer() {
     _statsTimer?.cancel();
-    debugPrint('[MainScreen] scheduling stats refresh every 3 min');
     _statsTimer = Timer.periodic(const Duration(minutes: 3), (_) {
-      debugPrint('[MainScreen] periodic tick — refreshing stats');
       _fetchStats();
     });
   }
@@ -140,9 +157,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
       }
     });
 
-    // ── Force Disconnect on Expiration ───────────────────────────────────────
-    // Listens to the stats provider out-of-band from the build phase. 
-    // If it detects the account is expired, it forces Xray to stop immediately.
+    // ── Force Disconnect on Expiration (در تمامی سیستم‌عامل‌ها) ───────────────
     ref.listen(subscriptionStatsProvider, (previous, next) {
       if (next != null) {
         final isNowExpired = next.isExpired ||
@@ -151,21 +166,14 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         if (isNowExpired) {
           final isConnected = ref.read(isConnectedProvider);
           if (isConnected) {
-            debugPrint('[MainScreen] Subscription expired! Force stopping Xray.');
-            ref.read(isConnectedProvider.notifier).state = false;
-            if (Platform.isWindows) {
-              try {
-                _winDivertFFI.close();
-                _wintunFFI.close();
-              } catch (_) {}
-            }
-            XrayBridge.stopXray();
+            debugPrint('[MainScreen] Subscription expired! Force stopping.');
+            ref.read(isConnectedProvider.notifier).set(false);
+            _safeStopAllTunnels();
           }
         }
       }
     });
 
-    // ── Expiration check ─────────────────────────────────────────────────────
     final bool isExpired = stats != null &&
         (stats.isExpired ||
             (!stats.isUnlimitedTraffic && stats.remainingTrafficGB <= 0));
@@ -185,16 +193,24 @@ class _MainScreenState extends ConsumerState<MainScreen> {
           // ── Background ────────────────────────────────────────────────────
           const AnimatedWaveBackground(),
 
-          // ── Main content ──────────────────────────────────────────────────
-          // If expired, shrink this area completely so HomeTab/Settings don't render behind the overlay
+          // ── Main content (IndexedStack جهت حفظ وضعیت HomeTab) ─────────────
           SafeArea(
             child: isExpired
                 ? const SizedBox.shrink()
-                : (navIndex == 0 ? HomeTab(autoConnectVpn: widget.autoConnectVpn) : const SettingsTab()),
+                : IndexedStack(
+                    index: navIndex,
+                    children: [
+                      HomeTab(
+                        autoConnectVpn: widget.autoConnectVpn,
+                        onRefreshStats: _fetchStats,
+                        isRefreshingStats: _isRefreshingStats,
+                      ),
+                      const SettingsTab(),
+                    ],
+                  ),
           ),
 
           // ── Bottom Nav (Glass) ────────────────────────────────────────────
-          // Hide the bottom navigation bar completely if the account is expired
           if (!isExpired)
             Positioned(
               bottom: 20,
@@ -207,15 +223,21 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                   backgroundColor: Colors.transparent,
                   elevation: 0,
                   currentIndex: navIndex,
-                  onTap: (index) =>
-                      ref.read(navIndexProvider.notifier).state = index,
+                  selectedItemColor: AppTheme.neonCyan,
+                  unselectedItemColor: Colors.white54,
+                  onTap: (index) {
+                    if (navIndex != index) {
+                      HapticFeedback.selectionClick();
+                      ref.read(navIndexProvider.notifier).set(index);
+                    }
+                  },
                   items: const [
                     BottomNavigationBarItem(
                       icon: Icon(Icons.home_filled),
                       label: 'خانه',
                     ),
                     BottomNavigationBarItem(
-                      icon: Icon(Icons.settings),
+                      icon: Icon(Icons.settings_rounded),
                       label: 'تنظیمات',
                     ),
                   ],
@@ -232,11 +254,11 @@ class _MainScreenState extends ConsumerState<MainScreen> {
               child: _PromoBanner(
                 promo: config.promotions,
                 onDismiss: () =>
-                    ref.read(isPromoDismissedProvider.notifier).state = true,
+                    ref.read(isPromoDismissedProvider.notifier).set(true),
               ),
             ),
 
-          // ── Notification Toasts (top-center) ─────────────────────────────
+          // ── Notification Toasts (top-center) ──────────────────────────────
           if (activeNotifs.isNotEmpty && !isExpired)
             Positioned(
               top: 0,
@@ -244,8 +266,8 @@ class _MainScreenState extends ConsumerState<MainScreen> {
               right: 0,
               child: SafeArea(
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 16, vertical: 8),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: activeNotifs
@@ -266,8 +288,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
             ),
 
           // ── Expiration Overlay ────────────────────────────────────────────
-          if (isExpired)
-            _ExpirationOverlay(onRefresh: _fetchStats),
+          if (isExpired) _ExpirationOverlay(onRefresh: _fetchStats),
 
           // ── Maintenance Overlay ───────────────────────────────────────────
           if (config != null && config.appControl.maintenanceMode.active)
@@ -290,7 +311,6 @@ class _MainScreenState extends ConsumerState<MainScreen> {
 // Overlay & Toast Widgets
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Full-screen OLED frosted-glass maintenance blocker.
 class _MaintenanceOverlay extends StatelessWidget {
   final String message;
   const _MaintenanceOverlay({required this.message});
@@ -301,7 +321,7 @@ class _MaintenanceOverlay extends StatelessWidget {
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
         child: Container(
-          color: Colors.black.withOpacity(0.88),
+          color: Colors.black.withValues(alpha: 0.88),
           alignment: Alignment.center,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 36),
@@ -317,7 +337,7 @@ class _MaintenanceOverlay extends StatelessWidget {
                 ),
                 const SizedBox(height: 24),
                 const Text(
-                  'در حال نگهداری',
+                  'در حال نگهداری و ارتقا',
                   style: TextStyle(
                     fontSize: 22,
                     fontWeight: FontWeight.bold,
@@ -340,12 +360,10 @@ class _MaintenanceOverlay extends StatelessWidget {
   }
 }
 
-/// Full-screen force-update blocker with download CTA.
 class _ForceUpdateOverlay extends StatelessWidget {
   final String updateUrl;
   final String version;
-  const _ForceUpdateOverlay(
-      {required this.updateUrl, required this.version});
+  const _ForceUpdateOverlay({required this.updateUrl, required this.version});
 
   @override
   Widget build(BuildContext context) {
@@ -353,7 +371,7 @@ class _ForceUpdateOverlay extends StatelessWidget {
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
         child: Container(
-          color: Colors.black.withOpacity(0.88),
+          color: Colors.black.withValues(alpha: 0.88),
           alignment: Alignment.center,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 36),
@@ -378,7 +396,7 @@ class _ForceUpdateOverlay extends StatelessWidget {
                 ),
                 const SizedBox(height: 10),
                 const Text(
-                  'برای ادامه استفاده لطفاً برنامه را به روز کنید.',
+                  'برای ادامه استفاده و تجربه بالاترین سرعت، لطفاً برنامه را به‌روز کنید.',
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 14, color: Colors.white60),
                 ),
@@ -396,8 +414,7 @@ class _ForceUpdateOverlay extends StatelessWidget {
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.transparent,
                         shadowColor: Colors.transparent,
-                        padding:
-                            const EdgeInsets.symmetric(vertical: 16),
+                        padding: const EdgeInsets.symmetric(vertical: 16),
                         shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(14)),
                       ),
@@ -429,22 +446,19 @@ class _ForceUpdateOverlay extends StatelessWidget {
 // Expiration Overlay
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Full-screen solid-background expiration blocker.
-/// [onRefresh] is wired to MainScreen._fetchStats so a manual check
-/// always runs against live server data even while this overlay is shown.
 class _ExpirationOverlay extends ConsumerStatefulWidget {
   final Future<void> Function() onRefresh;
   const _ExpirationOverlay({required this.onRefresh});
 
   @override
-  ConsumerState<_ExpirationOverlay> createState() =>
-      _ExpirationOverlayState();
+  ConsumerState<_ExpirationOverlay> createState() => _ExpirationOverlayState();
 }
 
 class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
   bool _isChecking = false;
 
   Future<void> _handleRefresh() async {
+    HapticFeedback.lightImpact();
     setState(() => _isChecking = true);
     await widget.onRefresh();
     if (mounted) setState(() => _isChecking = false);
@@ -461,16 +475,15 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                // ── Icon ──────────────────────────────────────────────────
                 Container(
                   width: 110,
                   height: 110,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: AppTheme.errorRed.withOpacity(0.08),
+                    color: AppTheme.errorRed.withValues(alpha: 0.08),
                     boxShadow: [
                       BoxShadow(
-                        color: AppTheme.errorRed.withOpacity(0.45),
+                        color: AppTheme.errorRed.withValues(alpha: 0.45),
                         blurRadius: 55,
                         spreadRadius: 12,
                       ),
@@ -490,10 +503,7 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                     ),
                   ),
                 ),
-
                 const SizedBox(height: 36),
-
-                // ── Message ───────────────────────────────────────────────
                 const Text(
                   'اشتراک شما به پایان رسید',
                   textAlign: TextAlign.center,
@@ -507,7 +517,7 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                 ),
                 const SizedBox(height: 10),
                 const Text(
-                  'لایسنس جدید خریداری کنید',
+                  'برای ادامه استفاده، اشتراک خود را تمدید یا لایسنس جدید تهیه کنید.',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     fontSize: 15,
@@ -515,10 +525,7 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                     height: 1.6,
                   ),
                 ),
-
                 const SizedBox(height: 44),
-
-                // ── Action buttons ────────────────────────────────────────
                 Row(
                   children: [
                     Expanded(
@@ -526,41 +533,26 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                         label: 'خروج از اکانت',
                         icon: Icons.logout_rounded,
                         onPressed: () async {
-                          final prefs =
-                              await SharedPreferences.getInstance();
+                          final prefs = await SharedPreferences.getInstance();
                           await prefs.remove('license_key');
 
-                          final isConnected =
-                              ref.read(isConnectedProvider);
+                          final isConnected = ref.read(isConnectedProvider);
                           if (isConnected) {
-                            if (Platform.isWindows) {
-                              try {
-                                _winDivertFFI.close();
-                                _wintunFFI.close();
-                              } catch (_) {}
-                            }
-                            XrayBridge.stopXray();
-                            ref
-                                .read(isConnectedProvider.notifier)
-                                .state = false;
+                            await _safeStopAllTunnels();
+                            ref.read(isConnectedProvider.notifier).set(false);
                           }
 
-                          ref
-                              .read(currentLicenseProvider.notifier)
-                              .state = null;
-                          ref
-                              .read(subscriptionJsonProvider.notifier)
-                              .state = null;
-                          ref
-                              .read(subscriptionStatsProvider.notifier)
-                              .state = null;
+                          ref.read(currentLicenseProvider.notifier).set(null);
+                          ref.read(subscriptionJsonProvider.notifier).set(null);
+                          ref.read(subscriptionStatsProvider.notifier).set(null);
 
                           if (context.mounted) {
-                            Navigator.pushReplacement(
+                            Navigator.pushAndRemoveUntil(
                               context,
                               MaterialPageRoute(
                                 builder: (_) => const LoginScreen(),
                               ),
+                              (route) => false,
                             );
                           }
                         },
@@ -569,7 +561,7 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                     const SizedBox(width: 14),
                     Expanded(
                       child: _ExpirationGradientButton(
-                        label: 'خرید لایسنس',
+                        label: 'خرید / تمدید',
                         icon: Icons.shopping_cart_checkout_rounded,
                         onPressed: () =>
                             UrlLauncherUtils.launchTelegramSupport(),
@@ -577,12 +569,7 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                     ),
                   ],
                 ),
-
                 const SizedBox(height: 20),
-
-                // ── Manual re-check button ────────────────────────────────
-                // Lets the user verify a renewal immediately without waiting
-                // for the next 3-minute timer tick.
                 TextButton.icon(
                   onPressed: _isChecking ? null : _handleRefresh,
                   icon: _isChecking
@@ -613,13 +600,15 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
   }
 }
 
-/// Vibrant Blue/Cyan gradient button used inside expiration overlay.
 class _ExpirationGradientButton extends StatelessWidget {
   final String label;
   final IconData icon;
   final VoidCallback onPressed;
-  const _ExpirationGradientButton(
-      {required this.label, required this.icon, required this.onPressed});
+  const _ExpirationGradientButton({
+    required this.label,
+    required this.icon,
+    required this.onPressed,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -633,7 +622,7 @@ class _ExpirationGradientButton extends StatelessWidget {
         borderRadius: BorderRadius.circular(14),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xFF00E5FF).withOpacity(0.35),
+            color: const Color(0xFF00E5FF).withValues(alpha: 0.35),
             blurRadius: 20,
             offset: const Offset(0, 6),
           ),
@@ -645,8 +634,8 @@ class _ExpirationGradientButton extends StatelessWidget {
           shadowColor: Colors.transparent,
           foregroundColor: Colors.black,
           padding: const EdgeInsets.symmetric(vertical: 16),
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
         ),
         onPressed: onPressed,
         icon: Icon(icon, size: 18, color: Colors.black),
@@ -663,13 +652,15 @@ class _ExpirationGradientButton extends StatelessWidget {
   }
 }
 
-/// Ghost/outline button used inside expiration overlay.
 class _ExpirationOutlineButton extends StatelessWidget {
   final String label;
   final IconData icon;
   final VoidCallback onPressed;
-  const _ExpirationOutlineButton(
-      {required this.label, required this.icon, required this.onPressed});
+  const _ExpirationOutlineButton({
+    required this.label,
+    required this.icon,
+    required this.onPressed,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -678,8 +669,7 @@ class _ExpirationOutlineButton extends StatelessWidget {
         foregroundColor: Colors.white70,
         side: const BorderSide(color: Colors.white24, width: 1.2),
         padding: const EdgeInsets.symmetric(vertical: 16),
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       ),
       onPressed: onPressed,
       icon: Icon(icon, size: 18, color: Colors.white54),
@@ -695,11 +685,30 @@ class _ExpirationOutlineButton extends StatelessWidget {
   }
 }
 
-/// Dismissible promo banner floating above bottom nav.
-class _PromoBanner extends StatelessWidget {
+// ════════════════════════════════════════════════════════════════════════════
+// Promo Banner (با بازخورد بصری کپی کد تخفیف)
+// ════════════════════════════════════════════════════════════════════════════
+
+class _PromoBanner extends StatefulWidget {
   final PromotionConfig promo;
   final VoidCallback onDismiss;
   const _PromoBanner({required this.promo, required this.onDismiss});
+
+  @override
+  State<_PromoBanner> createState() => _PromoBannerState();
+}
+
+class _PromoBannerState extends State<_PromoBanner> {
+  bool _copied = false;
+
+  void _copyCode() {
+    HapticFeedback.selectionClick();
+    Clipboard.setData(ClipboardData(text: widget.promo.discountCode));
+    setState(() => _copied = true);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _copied = false);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -709,15 +718,14 @@ class _PromoBanner extends StatelessWidget {
         filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
         child: Container(
           decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.08),
+            color: Colors.white.withValues(alpha: 0.08),
             borderRadius: BorderRadius.circular(18),
             border: Border.all(
-              color: AppTheme.neonPurple.withOpacity(0.4),
+              color: AppTheme.neonPurple.withValues(alpha: 0.4),
               width: 1,
             ),
           ),
-          padding:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Row(
             children: [
               const Icon(Icons.local_offer_rounded,
@@ -729,7 +737,7 @@ class _PromoBanner extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Text(
-                      promo.title,
+                      widget.promo.title,
                       style: const TextStyle(
                         fontWeight: FontWeight.bold,
                         fontSize: 14,
@@ -738,33 +746,41 @@ class _PromoBanner extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     GestureDetector(
-                      onTap: () {
-                        Clipboard.setData(
-                            ClipboardData(text: promo.discountCode));
-                      },
-                      child: Container(
+                      onTap: _copyCode,
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
                         padding: const EdgeInsets.symmetric(
                             horizontal: 8, vertical: 3),
                         decoration: BoxDecoration(
-                          color: AppTheme.neonPurple.withOpacity(0.2),
+                          color: _copied
+                              ? AppTheme.neonCyan.withValues(alpha: 0.2)
+                              : AppTheme.neonPurple.withValues(alpha: 0.2),
                           borderRadius: BorderRadius.circular(6),
                           border: Border.all(
-                              color:
-                                  AppTheme.neonPurple.withOpacity(0.5)),
+                            color: _copied
+                                ? AppTheme.neonCyan
+                                : AppTheme.neonPurple.withValues(alpha: 0.5),
+                          ),
                         ),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Icon(Icons.copy,
-                                size: 12, color: AppTheme.neonCyan),
+                            Icon(
+                              _copied ? Icons.check_rounded : Icons.copy,
+                              size: 12,
+                              color: AppTheme.neonCyan,
+                            ),
                             const SizedBox(width: 4),
                             Text(
-                              promo.discountCode,
+                              _copied
+                                  ? 'کپی شد!'
+                                  : widget.promo.discountCode,
                               style: const TextStyle(
-                                  color: AppTheme.neonCyan,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: 1.2),
+                                color: AppTheme.neonCyan,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1.0,
+                              ),
                             ),
                           ],
                         ),
@@ -774,9 +790,8 @@ class _PromoBanner extends StatelessWidget {
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.close,
-                    color: Colors.white54, size: 20),
-                onPressed: onDismiss,
+                icon: const Icon(Icons.close, color: Colors.white54, size: 20),
+                onPressed: widget.onDismiss,
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
               ),
@@ -788,12 +803,10 @@ class _PromoBanner extends StatelessWidget {
   }
 }
 
-/// Frosted-glass toast for a single in-app notification.
 class _NotificationToast extends StatelessWidget {
   final AppNotification notif;
   final VoidCallback onDismiss;
-  const _NotificationToast(
-      {required this.notif, required this.onDismiss});
+  const _NotificationToast({required this.notif, required this.onDismiss});
 
   Color get _borderColor {
     switch (notif.type) {
@@ -829,13 +842,12 @@ class _NotificationToast extends StatelessWidget {
         child: BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
           child: Container(
-            padding: const EdgeInsets.symmetric(
-                horizontal: 14, vertical: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.09),
+              color: Colors.white.withValues(alpha: 0.09),
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
-                  color: _borderColor.withOpacity(0.55), width: 1),
+                  color: _borderColor.withValues(alpha: 0.55), width: 1),
             ),
             child: Row(
               children: [
@@ -869,8 +881,7 @@ class _NotificationToast extends StatelessWidget {
                     onTap: onDismiss,
                     child: const Padding(
                       padding: EdgeInsets.only(left: 8),
-                      child: Icon(Icons.close,
-                          size: 16, color: Colors.white38),
+                      child: Icon(Icons.close, size: 16, color: Colors.white38),
                     ),
                   ),
               ],
@@ -888,7 +899,15 @@ class _NotificationToast extends StatelessWidget {
 
 class HomeTab extends ConsumerStatefulWidget {
   final bool autoConnectVpn;
-  const HomeTab({super.key, this.autoConnectVpn = false});
+  final Future<void> Function()? onRefreshStats;
+  final bool isRefreshingStats;
+
+  const HomeTab({
+    super.key,
+    this.autoConnectVpn = false,
+    this.onRefreshStats,
+    this.isRefreshingStats = false,
+  });
 
   @override
   ConsumerState<HomeTab> createState() => _HomeTabState();
@@ -896,6 +915,7 @@ class HomeTab extends ConsumerStatefulWidget {
 
 class _HomeTabState extends ConsumerState<HomeTab> {
   bool _isConnecting = false;
+  bool _abortRequested = false;
   bool _isMeasuringLatency = false;
   bool _latencyProbeError = false;
 
@@ -904,9 +924,6 @@ class _HomeTabState extends ConsumerState<HomeTab> {
   int _currentNodeLatencyMs = -1;
   int _bestNodeLatencyMs = -1;
 
-  // ── DNS & Real-Delay Optimizer ────────────────────────────────────────────
-  // These run silently on connect. They do NOT alter _bestNodeLatencyMs;
-  // the UI badge always displays the fast TCP ping from _latencyTester.
   final DnsManager _dnsManager = DnsManager();
   final ConnectionOptimizer _connectionOptimizer = ConnectionOptimizer();
   OptimizedResult? _lastOptimizedResult;
@@ -914,46 +931,102 @@ class _HomeTabState extends ConsumerState<HomeTab> {
   @override
   void dispose() {
     _latencyTester.stop();
-    // Cancel any in-flight benchmarking to free the Xray isolate + ephemeral ports
-    _connectionOptimizer.cancel();
+    _connectionOptimizer.cancelSync(); // dispose() است همزمان — از نسخه sync استفاده می‌کنیم
+    // ── آزادسازی کالبک‌های DesktopManager برای جلوگیری از leak ──────────────
+    final dm = DesktopManager();
+    if (dm.onToggleConnectionRequested != null) {
+      dm.onToggleConnectionRequested = null;
+    }
+    if (dm.onModeChanged != null) {
+      dm.onModeChanged = null;
+    }
+    if (dm.onBeforeExitCleanup != null) {
+      dm.onBeforeExitCleanup = null;
+    }
     super.dispose();
   }
 
   @override
   void initState() {
     super.initState();
+    // ── Bug Fix: اتصال کالبک‌های منوی Tray به HomeTabState ─────────────────
+    final dm = DesktopManager();
+    dm.onToggleConnectionRequested = () {
+      if (mounted) _toggleConnection();
+    };
+    dm.onModeChanged = (mode) {
+      if (!mounted) return;
+      final targetVpn = mode == DesktopRoutingMode.tunnelVpn;
+      final targetSysProxy = mode == DesktopRoutingMode.proxySystem;
+      ref.read(isVpnModeProvider.notifier).set(targetVpn);
+      ref.read(isSystemProxyProvider.notifier).set(targetSysProxy);
+    };
+    dm.onBeforeExitCleanup = () async {
+      if (ref.read(isConnectedProvider)) {
+        await _safeStopAllTunnels();
+      }
+    };
+
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final license = ref.read(currentLicenseProvider);
 
-      // ── Early-return path: subscription JSON already cached ──────────────
       if (license == null || ref.read(subscriptionJsonProvider) != null) {
         for (int i = 0; i < 10; i++) {
+          if (!mounted) return;
           if (ref.read(remoteConfigProvider) != null) break;
           await Future.delayed(const Duration(milliseconds: 500));
         }
+        if (!mounted) return;
         _maybeStartLatencyTester();
         return;
       }
 
-      // ── Normal path: fetch subscription JSON first ───────────────────────
       RemoteConfig? config;
       for (int i = 0; i < 10; i++) {
+        if (!mounted) return;
         config = ref.read(remoteConfigProvider);
         if (config != null) break;
         await Future.delayed(const Duration(milliseconds: 500));
       }
+      if (!mounted) return;
+
       if (config != null) {
         final subService = SubscriptionService(
           config.apiEndpoints.baseJsonSubUrl,
           config.apiEndpoints.baseSubsStatsUrl.isNotEmpty
               ? config.apiEndpoints.baseSubsStatsUrl.first
               : '',
+          // ── Bug Fix: Failover URLs برای دریافت اشتراک ──────────────────
+          failoverSubUrls: config.apiEndpoints.failoverApiUrls,
+          failoverStatsUrls: config.apiEndpoints.baseSubsStatsUrl.length > 1
+              ? config.apiEndpoints.baseSubsStatsUrl.sublist(1)
+              : const [],
         );
-        final sub = await subService.fetchSubscription(license);
-        if (sub != null) {
-          ref.read(subscriptionJsonProvider.notifier).state = sub;
+        var sub = await subService.fetchSubscription(license);
+
+        // پشتیبان اضطراری در صورت مسدود بودن تمام دامنه‌های اشتراک
+        if (sub == null &&
+            config.emergencyAccess.enableHardcodedFallback &&
+            config.emergencyAccess.fallbackNodes.isNotEmpty) {
+          final fallbackList = <dynamic>[];
+          for (final raw in config.emergencyAccess.fallbackNodes) {
+            try {
+              final parsed = jsonDecode(raw);
+              if (parsed is Map) fallbackList.add(parsed);
+            } catch (_) {
+              fallbackList.add({'address': raw, 'port': 443});
+            }
+          }
+          if (fallbackList.isNotEmpty) {
+            sub = fallbackList;
+          }
+        }
+
+        if (sub != null && mounted) {
+          ref.read(subscriptionJsonProvider.notifier).set(sub);
         }
       }
+      if (!mounted) return;
       _maybeStartLatencyTester();
       if (widget.autoConnectVpn) {
         _toggleConnection();
@@ -981,31 +1054,48 @@ class _HomeTabState extends ConsumerState<HomeTab> {
           });
         }
         final isConnected = ref.read(isConnectedProvider);
-        if (!isConnected) return;
+        if (!isConnected || _isConnecting) return;
         if (best.node == _currentNode) return;
-        debugPrint('[LatencyTester] Switching to better node '
-            '(${best.latencyMs}ms vs current ${_currentNodeLatencyMs}ms)');
+
+        // بررسی سقف مجاز پینگ جهت اتصال مجدد خودکار (Auto Reconnect)
+        final threshold =
+            config?.networkProbes.autoReconnectPingThresholdMs ?? 0;
+        final bool isHighPing = threshold > 0 &&
+            _currentNodeLatencyMs > threshold &&
+            best.latencyMs > 0 &&
+            best.latencyMs < threshold;
+
+        // جلوگیری از قطع و وصل بی‌مورد در نوسان‌های جزئی پینگ:
+        // فقط زمانی نود را در پس‌زمینه عوض کن که پینگ بالاتر از آستانه اضطراری باشد،
+        // نود فعلی قطع شده باشد یا نود جدید حداقل ۴۰ میلی‌ثانیه و ۳۰٪ سریع‌تر باشد.
+        final bool shouldSwitch = isHighPing ||
+            _currentNodeLatencyMs <= 0 ||
+            (best.latencyMs > 0 &&
+                (_currentNodeLatencyMs - best.latencyMs) >= 40 &&
+                best.latencyMs < (_currentNodeLatencyMs * 0.7));
+
+        if (!shouldSwitch) return;
+
+        debugPrint('[LatencyTester] Switching to significantly better node '
+            '(${best.latencyMs}ms vs current ${_currentNodeLatencyMs}ms, highPing=$isHighPing)');
+        _currentNodeLatencyMs = best.latencyMs;
         _connectNode(best.node);
       },
     );
   }
 
-  /// One-shot latency probe triggered by tapping the latency badge.
   Future<void> _refreshLatency() async {
     if (_isMeasuringLatency) return;
+    HapticFeedback.lightImpact();
 
     setState(() {
       _isMeasuringLatency = true;
       _latencyProbeError = false;
     });
-    debugPrint('[_refreshLatency] tap received');
 
     try {
       final nodes = ref.read(subscriptionJsonProvider);
-      debugPrint('[_refreshLatency] nodes: ${nodes?.length ?? 'null'}');
-
       if (nodes == null || nodes.isEmpty) {
-        debugPrint('[_refreshLatency] no nodes available');
         if (mounted) setState(() => _latencyProbeError = true);
         return;
       }
@@ -1014,50 +1104,90 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       final results = await oneShot.measureAll(nodes);
       oneShot.stop();
 
-      debugPrint('[_refreshLatency] results: '
-          '${results?.map((r) => '${r.latencyMs}ms').toList()}');
-
       final best = results?.firstOrNull;
       final isConnected = ref.read(isConnectedProvider);
       final isVpnMode = ref.read(isVpnModeProvider);
 
       if (mounted) {
         if (best != null && best.latencyMs > 0) {
-          // Ignore FakeDNS local loopback pings (which always return 1-5ms)
           if (isConnected && isVpnMode && best.latencyMs <= 5) {
-            debugPrint('[_refreshLatency] Ignored ${best.latencyMs}ms FakeDNS local loopback');
             setState(() => _isMeasuringLatency = false);
             return;
           }
-          
+
           setState(() {
             _bestNodeLatencyMs = best.latencyMs;
+            _currentNodeLatencyMs = best.latencyMs;
             _latencyProbeError = false;
           });
         } else {
           setState(() => _latencyProbeError = true);
         }
       }
-    } catch (e, st) {
-      debugPrint('[_refreshLatency] failed: $e\n$st');
+    } catch (e) {
       if (mounted) setState(() => _latencyProbeError = true);
     } finally {
       if (mounted) setState(() => _isMeasuringLatency = false);
     }
   }
 
+  // ── Mode Switcher Handler (هماهنگ با SettingsTab) ─────────────────────────
+
+  Future<void> _handleModeSwitch(bool targetVpnMode) async {
+    final currentMode = ref.read(isVpnModeProvider);
+    if (currentMode == targetVpnMode) return;
+
+    HapticFeedback.selectionClick();
+    ref.read(isVpnModeProvider.notifier).set(targetVpnMode);
+    if (DesktopManager().isDesktop) {
+      if (targetVpnMode) {
+        ref.read(isSystemProxyProvider.notifier).set(false);
+        await DesktopManager().applySystemProxy(enable: false);
+      }
+      await DesktopManager().updateTrayIcon(
+        ref.read(isConnectedProvider),
+        mode: targetVpnMode
+            ? DesktopRoutingMode.tunnelVpn
+            : (ref.read(isSystemProxyProvider)
+                ? DesktopRoutingMode.proxySystem
+                : DesktopRoutingMode.proxyLocal),
+      );
+    }
+
+    // اگر در حال حاضر متصل هستیم، برای جلوگیری از عدم تطابق تونل، اتصال را با حالت جدید بازسازی کن
+    final isConnected = ref.read(isConnectedProvider);
+    if (isConnected && !_isConnecting && _currentNode != null) {
+      await _connectNode(_currentNode);
+    }
+  }
+
   // ── Connection logic ──────────────────────────────────────────────────────
 
   Future<void> _toggleConnection() async {
+    HapticFeedback.mediumImpact();
     final isConnected = ref.read(isConnectedProvider);
     final isVpnMode = ref.read(isVpnModeProvider);
 
-    // ── DISCONNECT LOGIC ──
+    // ── ۱. امکان لغو فوری در حین تلاش برای اتصال (Abort In-Flight Connect) ──
+    if (_isConnecting) {
+      debugPrint('[_toggleConnection] Aborting in-flight connection attempt.');
+      _abortRequested = true;
+      _connectionOptimizer.cancelSync(); // لغو فوری — نیازی به await نیست
+      if (mounted) {
+        setState(() {
+          _isConnecting = false;
+          _bestNodeLatencyMs = -1;
+        });
+      }
+      await _safeStopAllTunnels();
+      ref.read(isConnectedProvider.notifier).set(false);
+      return;
+    }
+
+    // ── ۲. منطق قطع اتصال (DISCONNECT LOGIC) ──
     if (isConnected) {
-      debugPrint('[_toggleConnection] Disconnect initiated. Force stopping Xray.');
-      
-      // 1. Instantly update UI and Provider states
-      ref.read(isConnectedProvider.notifier).state = false;
+      debugPrint('[_toggleConnection] Disconnect initiated.');
+      ref.read(isConnectedProvider.notifier).set(false);
       _currentNode = null;
       _currentNodeLatencyMs = -1;
       _lastOptimizedResult = null;
@@ -1068,43 +1198,36 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         });
       }
 
-      // 2. Abort any in-flight DNS optimization (fire-and-forget — disconnect
-      //    must be instant). The _cancelled flag is set synchronously inside
-      //    cancel() so any probe Futures still running will short-circuit.
-      // ignore: discarded_futures
-      _connectionOptimizer.cancel();
-
-      // 3. Safely tear down the isolate and VPN natively
-      if (Platform.isWindows) {
-        try {
-          _winDivertFFI.close();
-          _wintunFFI.close();
-        } catch (_) {}
-      }
-      if (Platform.isAndroid && isVpnMode) {
-        const vpnChannel = MethodChannel('candyconnect/vpn');
-        await vpnChannel.invokeMethod('stopVpn').catchError((_) {});
-      }
-      await XrayBridge.stopXray();
+      _connectionOptimizer.cancelSync();
+      await _safeStopAllTunnels();
       return;
     }
 
-    // ── CONNECT LOGIC ──
+    // ── ۳. منطق اتصال (CONNECT LOGIC) ──
     if (Platform.isWindows && isVpnMode) {
       if (!ElevationUtils.isElevated()) {
         ElevationUtils.relaunchElevated(['--auto-connect-vpn']);
         return;
       }
     }
-    final subJsonList = ref.read(subscriptionJsonProvider);
-    if (subJsonList == null || subJsonList.isEmpty) return;
 
+    final subJsonList = ref.read(subscriptionJsonProvider);
+    if (subJsonList == null || subJsonList.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('در حال دریافت اطلاعات سرورها، لطفاً چند لحظه صبر کنید...'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+      return;
+    }
+
+    _abortRequested = false;      // Reset BEFORE setState to prevent micro-gap
     setState(() => _isConnecting = true);
 
     // ── Phase 1 (TCP): Race all nodes via TCP handshake ───────────────────
-    // This is the FAST phase. It populates the UI badge and picks top-3 nodes
-    // to feed into the real-delay benchmark. _bestNodeLatencyMs is set here
-    // and is NEVER touched again — the UI always shows the TCP ping (Phase 5).
     NodeLatencyResult? bestResult;
     List<dynamic> top3Nodes = [];
     try {
@@ -1112,7 +1235,6 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       final results = await oneShot.measureAll(subJsonList);
       oneShot.stop();
       bestResult = results?.firstOrNull;
-      // Collect top-3 reachable nodes for variant generation
       top3Nodes = results
               ?.where((r) => r.isReachable)
               .take(3)
@@ -1121,7 +1243,8 @@ class _HomeTabState extends ConsumerState<HomeTab> {
           [];
     } catch (_) {}
 
-    // Publish TCP-ping result to UI immediately (Phase 5 — badge = TCP only)
+    if (_abortRequested || !mounted) return;
+
     _currentNode = bestResult?.node ?? subJsonList.first;
     _currentNodeLatencyMs = bestResult?.latencyMs ?? -1;
     if (mounted && _currentNodeLatencyMs > 0) {
@@ -1129,26 +1252,23 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     }
 
     // ── Phase 2 & 3 (Silent): Bootstrap DNS race + Real-delay benchmark ───
-    // Runs entirely in the background — no setState, no UI changes.
-    // The result is stored in _lastOptimizedResult for use in _connectNode().
     _lastOptimizedResult = null;
     final config = ref.read(remoteConfigProvider);
     if (config != null && top3Nodes.isNotEmpty) {
       try {
-        _connectionOptimizer.reset(); // clear any prior cancellation flag
+        _connectionOptimizer.reset();
 
-        // Phase 1: Race Bootstrap DNS candidates (TCP-to-port-53)
         final bootstrapDns = await _dnsManager.raceBestBootstrap(
           config.dnsRouting.bootstrapDnsPool,
         );
 
-        // Phase 2: Cross-multiply top-3 nodes × remoteDnsPool
+        if (_abortRequested || !mounted) return;
+
         final variants = _dnsManager.generateVariants(
           nodes: top3Nodes,
           remoteDnsPool: config.dnsRouting.remoteDnsPool,
         );
 
-        // Phase 3: HTTP real-delay benchmark via temporary Xray isolate
         final effectiveProbeUrl =
             config.networkProbes.latencyTargetUrl.isNotEmpty
                 ? config.networkProbes.latencyTargetUrl
@@ -1160,15 +1280,13 @@ class _HomeTabState extends ConsumerState<HomeTab> {
           probeUrl: effectiveProbeUrl,
         );
       } catch (e) {
-        // Optimization is best-effort; a failure here is non-fatal.
-        // _connectNode() will use the TCP winner and no custom DNS injection.
         debugPrint('[HomeTab] Silent DNS optimization failed: $e');
       }
     }
 
+    if (_abortRequested || !mounted) return;
+
     // ── Phase 4: Connect with the best available node ─────────────────────
-    // Prefer the real-delay winner; fall back to TCP winner if optimization
-    // failed or was skipped.
     final nodeToConnect = (_lastOptimizedResult?.node ??
         (bestResult?.node ?? subJsonList.first)) as Map<String, dynamic>;
     _currentNode = nodeToConnect;
@@ -1180,46 +1298,47 @@ class _HomeTabState extends ConsumerState<HomeTab> {
   Future<void> _connectNode(dynamic rawNode) async {
     if (rawNode is! Map<String, dynamic>) return;
 
-    final node = Map<String, dynamic>.from(
-      jsonDecode(jsonEncode(rawNode)) as Map<String, dynamic>,
-    );
+    // ── عمیق‌کلونی ایمن برای جلوگیری از تغییر ناخواسته نود اصلی ────────────────────
+    Map<String, dynamic> node;
+    try {
+      node = Map<String, dynamic>.from(
+        jsonDecode(jsonEncode(rawNode)) as Map<String, dynamic>,
+      );
+    } catch (_) {
+      // fallback: shallow copy (safe since we only add/overwrite top-level keys)
+      node = Map<String, dynamic>.from(rawNode);
+    }
 
     _currentNode = rawNode;
 
     final isConnected = ref.read(isConnectedProvider);
     final isVpnMode = ref.read(isVpnModeProvider);
-    
+
     if (isConnected) {
-      // Instantly kill it if replacing an active connection
-      ref.read(isConnectedProvider.notifier).state = false;
-      if (Platform.isWindows) {
-        try {
-          _winDivertFFI.close();
-          _wintunFFI.close();
-        } catch (_) {}
-      }
-      await XrayBridge.stopXray();
+      ref.read(isConnectedProvider.notifier).set(false);
+      await _safeStopAllTunnels();
     }
+
+    if (_abortRequested || !mounted) return;
 
     if (Platform.isAndroid && isVpnMode) {
       const vpnChannel = MethodChannel('candyconnect/vpn');
       try {
-        // 1. Await permission (halts until user decides via onActivityResult)
-        final granted = await vpnChannel.invokeMethod<bool>('prepareVpn') ?? false;
+        final granted =
+            await vpnChannel.invokeMethod<bool>('prepareVpn') ?? false;
         if (!granted) {
           if (mounted) setState(() => _isConnecting = false);
           return;
         }
 
-        // 2. Fetch Proxy state from Riverpod
         final proxyMode = ref.read(perAppProxyModeProvider);
         final selectedApps = ref.read(selectedAppsProvider).toList();
 
-        // 3. Start VPN and get fd
         final fd = await vpnChannel.invokeMethod<int>('startVpn', {
-          'proxyMode': proxyMode,
-          'selectedApps': selectedApps,
-        }) ?? -1;
+              'proxyMode': proxyMode,
+              'selectedApps': selectedApps,
+            }) ??
+            -1;
 
         node.putIfAbsent('env', () => <String, dynamic>{});
         (node['env'] as Map)['xray.tun.fd'] = fd;
@@ -1236,7 +1355,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         }
       }
       node.putIfAbsent('env', () => <String, dynamic>{});
-      (node['env'] as Map)['xray.tun.fd'] = -1; 
+      (node['env'] as Map)['xray.tun.fd'] = -1;
     } else {
       (node['env'] as Map?)?.remove('xray.tun.fd');
     }
@@ -1249,24 +1368,14 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       }
     }
 
-    // ── Phase 4: DNS Architecture Injection (all modes, all platforms) ───────
-    // When the ConnectionOptimizer produced a result, we inject the two-tier
-    // DNS architecture into the Xray config:
-    //   • Bootstrap DNS → routed DIRECT (resolves proxy server IPs natively)
-    //   • Remote DNS    → routed via PROXY (resolves blocked domains safely)
-    // This block runs before the VPN-specific FakeDNS block below so that
-    // the Windows VPN path can simply prepend "fakedns" to our server list.
+    // ── Phase 4: DNS Architecture Injection ───────────────────────────────
     final optimized = _lastOptimizedResult;
     if (optimized != null) {
-      // Ensure the dns key is a mutable map
       if (node['dns'] == null || node['dns'] is! Map) {
         node['dns'] = <String, dynamic>{};
       }
       final dnsMap = node['dns'] as Map<String, dynamic>;
 
-      // Preserve any domain-specific DNS server overrides already in the config
-      // (e.g. geolocation-based split-DNS rules from the subscription server).
-      // Discard bare IP strings and plain 'localhost' — we replace them below.
       final preservedServers = <dynamic>[];
       if (dnsMap['servers'] is List) {
         for (final s in dnsMap['servers'] as List) {
@@ -1276,18 +1385,13 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         }
       }
 
-      // Bootstrap DNS first — Xray queries this for direct-routed domains,
-      // including the proxy server's own hostname.
-      // Remote DNS second — used for all other (proxy-routed) lookups.
       dnsMap['servers'] = [
         optimized.bootstrapDns,
         optimized.remoteDns,
-        'localhost', // final fallback for local LAN names
+        'localhost',
         ...preservedServers,
       ];
 
-      // Routing: force Bootstrap DNS traffic to go Direct so Xray can resolve
-      // the proxy server's IP without routing through the proxy itself.
       if (node['routing'] == null || node['routing'] is! Map) {
         node['routing'] = <String, dynamic>{};
       }
@@ -1303,16 +1407,9 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         },
         ...existingDnsRules,
       ];
-
-      debugPrint(
-        '[_connectNode] DNS architecture injected — '
-        'bootstrap: ${optimized.bootstrapDns} (→ direct), '
-        'remote: ${optimized.remoteDns} (→ proxy)',
-      );
     }
 
     if (Platform.isWindows && isVpnMode) {
-      // 1. Enable FakeDNS
       node['dns'] ??= {};
       node['dns']['servers'] = [
         "fakedns",
@@ -1322,11 +1419,11 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         {"ipPool": "198.18.0.0/15", "poolSize": 65535}
       ];
 
-      // 2. Inject Xray's native TUN inbound for Windows (replaces dokodemo-door & manual Wintun)
-      final existingInbounds = List<dynamic>.from(node['inbounds'] as List? ?? []);
+      final existingInbounds =
+          List<dynamic>.from(node['inbounds'] as List? ?? []);
       for (var inbound in existingInbounds) {
         if (inbound is Map && inbound['port'] == 10808) {
-          inbound['port'] = 10810; // Remap to avoid conflict if necessary
+          inbound['port'] = 10810;
         }
       }
 
@@ -1352,20 +1449,19 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         },
         ...existingInbounds
       ];
-      
-      // 3. Inject FakeDNS Routing Rules
-      final existingOutbounds = List<dynamic>.from(node['outbounds'] as List? ?? []);
-      bool hasDnsOut = existingOutbounds.any((o) => o is Map && o['tag'] == 'dns-out');
+
+      final existingOutbounds =
+          List<dynamic>.from(node['outbounds'] as List? ?? []);
+      bool hasDnsOut =
+          existingOutbounds.any((o) => o is Map && o['tag'] == 'dns-out');
       if (!hasDnsOut) {
-        existingOutbounds.insert(0, {
-          "tag": "dns-out",
-          "protocol": "dns"
-        });
+        existingOutbounds.insert(0, {"tag": "dns-out", "protocol": "dns"});
         node['outbounds'] = existingOutbounds;
       }
-      
+
       node['routing'] ??= {};
-      final existingRules = List<dynamic>.from(node['routing']['rules'] as List? ?? []);
+      final existingRules =
+          List<dynamic>.from(node['routing']['rules'] as List? ?? []);
       node['routing']['rules'] = [
         {
           "type": "field",
@@ -1377,7 +1473,8 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       ];
     }
 
-    // ── Universal Geo-Routing Asset Injection ──────────────────────────────
+    // ── Universal Geo-Routing & Split-Tunneling Asset Injection ───────────
+    final config = ref.read(remoteConfigProvider);
     String? geoAssetDir;
     try {
       geoAssetDir = await XrayBridge.ensureRoutingAssets();
@@ -1388,16 +1485,113 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     if (geoAssetDir != null) {
       node.putIfAbsent('env', () => <String, dynamic>{});
       (node['env'] as Map)['xray.location.asset'] = geoAssetDir;
+    }
 
-      node.putIfAbsent('routing', () => <String, dynamic>{});
-      final routingMap = node['routing'] as Map<String, dynamic>;
-      final existingRules = List<dynamic>.from(routingMap['rules'] as List? ?? []);
-      routingMap['rules'] = [
-        {'type': 'field', 'ip':     ['geoip:private'], 'outboundTag': 'direct'},
-        {'type': 'field', 'ip':     ['geoip:ir'],      'outboundTag': 'direct'},
-        {'type': 'field', 'domain': ['geosite:ir'],    'outboundTag': 'direct'},
-        ...existingRules,
-      ];
+    // تزریق قوانین تقسیم ترافیک (Split Tunneling) و مسدودسازی تبلیغات از RemoteConfig
+    node.putIfAbsent('routing', () => <String, dynamic>{});
+    final routingMap = node['routing'] as Map<String, dynamic>;
+    final existingRules =
+        List<dynamic>.from(routingMap['rules'] as List? ?? []);
+    final splitRules = <Map<String, dynamic>>[];
+
+    final split = config?.splitTunneling;
+    final bypassDomestic = split?.bypassDomesticTraffic ?? true;
+    final directDomains = split?.directDomains ?? <String>[];
+    final blockAds = split?.blockAdsAndTrackers ?? false;
+    final blockedDomains = split?.blockedDomains ?? <String>[];
+
+    // مسدودسازی تبلیغات و دامنه‌های مخرب
+    if (blockAds) {
+      splitRules.add({
+        'type': 'field',
+        'domain': ['geosite:category-ads-all', ...blockedDomains],
+        'outboundTag': 'block',
+      });
+    } else if (blockedDomains.isNotEmpty) {
+      splitRules.add({
+        'type': 'field',
+        'domain': blockedDomains,
+        'outboundTag': 'block',
+      });
+    }
+
+    // هدایت مستقیم سایت‌های داخلی و بانکی
+    final directList = <String>[];
+    if (bypassDomestic) {
+      directList.add('geosite:ir');
+    }
+    directList.addAll(directDomains);
+
+    if (directList.isNotEmpty) {
+      splitRules.add({
+        'type': 'field',
+        'domain': directList,
+        'outboundTag': 'direct',
+      });
+    }
+
+    if (bypassDomestic) {
+      splitRules.add({
+        'type': 'field',
+        'ip': ['geoip:private', 'geoip:ir'],
+        'outboundTag': 'direct',
+      });
+    } else {
+      splitRules.add({
+        'type': 'field',
+        'ip': ['geoip:private'],
+        'outboundTag': 'direct',
+      });
+    }
+
+    routingMap['rules'] = [
+      ...splitRules,
+      ...existingRules,
+    ];
+
+    // ── تزریق تنظیمات ضد فیلترینگ (Anti-DPI Overrides) ─────────────────────
+    final antiDpi = config?.antiDpiOverrides;
+    if (antiDpi != null &&
+        antiDpi.enableDynamicTweaks &&
+        antiDpi.fragmentLength.isNotEmpty) {
+      if (node['outbounds'] is List) {
+        for (final ob in node['outbounds'] as List) {
+          if (ob is Map &&
+              ob['tag'] != 'direct' &&
+              ob['tag'] != 'block' &&
+              ob['tag'] != 'dns-out') {
+            ob.putIfAbsent('streamSettings', () => <String, dynamic>{});
+            final stream = ob['streamSettings'] as Map<String, dynamic>;
+            stream.putIfAbsent('sockopt', () => <String, dynamic>{});
+            final sockopt = stream['sockopt'] as Map<String, dynamic>;
+            sockopt['fragment'] = {
+              'packets': 'tlshello',
+              'length': antiDpi.fragmentLength,
+              'interval': antiDpi.fragmentInterval.isNotEmpty
+                  ? antiDpi.fragmentInterval
+                  : '10-20',
+            };
+          }
+        }
+      }
+    }
+
+    // ── تزریق همگام‌سازی سوکت‌ها (Mux / Smux) ──────────────────────────────
+    final smux = config?.clientPreferences.smux;
+    if (smux != null && smux.enabled) {
+      if (node['outbounds'] is List) {
+        for (final ob in node['outbounds'] as List) {
+          if (ob is Map &&
+              ob['tag'] != 'direct' &&
+              ob['tag'] != 'block' &&
+              ob['tag'] != 'dns-out') {
+            ob['mux'] = {
+              'enabled': true,
+              'concurrency': smux.maxConnections > 0 ? smux.maxConnections : 8,
+            };
+          }
+        }
+      }
     }
 
     final jsonString = jsonEncode(node);
@@ -1412,8 +1606,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
             final jsonMap = jsonDecode(message);
             if (jsonMap['success'] == false) {
               hasError = true;
-              errorMessage =
-                  jsonMap['error']?.toString() ?? 'Unknown error';
+              errorMessage = jsonMap['error']?.toString() ?? 'Unknown error';
             } else if (jsonMap['success'] != true) {
               hasError = true;
               errorMessage = message;
@@ -1427,27 +1620,46 @@ class _HomeTabState extends ConsumerState<HomeTab> {
 
       await Future.delayed(const Duration(seconds: 1));
 
+      if (_abortRequested || !mounted) {
+        await _safeStopAllTunnels();
+        return;
+      }
+
       if (hasError) {
-        ref.read(isConnectedProvider.notifier).state = false;
+        ref.read(isConnectedProvider.notifier).set(false);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-                content: Text('خطا در اجرای هسته: $errorMessage'),
-                backgroundColor: Colors.red),
+              content: Text('خطا در اجرای هسته: $errorMessage'),
+              backgroundColor: Colors.red,
+            ),
           );
         }
       } else {
-        ref.read(isConnectedProvider.notifier).state = true;
-        if (mounted) setState(() => _isConnecting = false); // Stop the spinner instantly
-        
-        // After Xray starts, activate DNS leak protection in the background
+        ref.read(isConnectedProvider.notifier).set(true);
+        if (mounted) setState(() => _isConnecting = false);
+
         if (Platform.isWindows && isVpnMode) {
           Future.microtask(() async {
             int wintunIfIdx = -1;
             for (int i = 0; i < 10; i++) {
+              if (!mounted || !ref.read(isConnectedProvider) || _abortRequested) {
+                return;
+              }
               await Future.delayed(const Duration(milliseconds: 500));
-              wintunIfIdx = await _wintunFFI.getInterfaceIndex("CandyConnectVPN Tunnel");
+              if (!mounted || !ref.read(isConnectedProvider) || _abortRequested) {
+                return;
+              }
+              wintunIfIdx = await _wintunFFI
+                  .getInterfaceIndex("CandyConnectVPN Tunnel");
+              if (wintunIfIdx == -1) {
+                wintunIfIdx =
+                    await _wintunFFI.getInterfaceIndex("CandyConnectVPN");
+              }
               if (wintunIfIdx != -1) break;
+            }
+            if (!mounted || !ref.read(isConnectedProvider) || _abortRequested) {
+              return;
             }
             if (wintunIfIdx != -1) {
               _winDivertFFI.startAntiSmhnr(wintunIfIdx);
@@ -1456,7 +1668,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         }
       }
     } catch (e) {
-      ref.read(isConnectedProvider.notifier).state = false;
+      ref.read(isConnectedProvider.notifier).set(false);
     } finally {
       if (mounted) {
         setState(() => _isConnecting = false);
@@ -1464,6 +1676,18 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     }
   }
 
+  /// محاسبه هوشمند کسر روزهای باقیمانده متناسب با بسته‌های ۳۰، ۶۰ و ۹۰ روزه
+  double _computeDaysFraction(dynamic stats) {
+    if (stats == null) return 0.0;
+    if (stats.isUnlimitedTime) return 1.0;
+    if (stats.isExpired || stats.daysRemaining <= 0) return 0.0;
+
+    final int days = stats.daysRemaining;
+    final double cycleMax = days > 60
+        ? 90.0
+        : (days > 30 ? 60.0 : 30.0);
+    return (days / cycleMax).clamp(0.0, 1.0);
+  }
 
   // ── Build ─────────────────────────────────────────────────────────────────
 
@@ -1473,313 +1697,406 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     final isVpnMode = ref.watch(isVpnModeProvider);
     final stats = ref.watch(subscriptionStatsProvider);
 
-    return Column(
-      children: [
-        // ── Top Navbar toggles ───────────────────────────────────────────
-        Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: GlassCard(
-            height: 60,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: GestureDetector(
-                    onTap: () =>
-                        ref.read(isVpnModeProvider.notifier).state = true,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 300),
-                      decoration: BoxDecoration(
-                        color: isVpnMode
-                            ? AppTheme.neonCyan.withOpacity(0.2)
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      alignment: Alignment.center,
-                      child: Text(
-                        'VPN',
-                        style: TextStyle(
-                          color: isVpnMode
-                              ? AppTheme.neonCyan
-                              : Colors.white54,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                Expanded(
-                  child: GestureDetector(
-                    onTap: () =>
-                        ref.read(isVpnModeProvider.notifier).state = false,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 300),
-                      decoration: BoxDecoration(
-                        color: !isVpnMode
-                            ? AppTheme.neonPurple.withOpacity(0.2)
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      alignment: Alignment.center,
-                      child: Text(
-                        'حالت پروکسی',
-                        style: TextStyle(
-                          color: !isVpnMode
-                              ? AppTheme.neonPurple
-                              : Colors.white54,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        const Spacer(),
-
-        // ── Connection Button ────────────────────────────────────────────
-        GestureDetector(
-          onTap: _isConnecting ? null : _toggleConnection,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeInOut,
-            width: 200,
-            height: 200,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: AppTheme.oledDark,
-              border: Border.all(
-                color: isConnected ? AppTheme.neonCyan : Colors.white24,
-                width: 2,
-              ),
-              boxShadow: isConnected
-                  ? [
-                      BoxShadow(
-                        color: AppTheme.neonCyan.withOpacity(0.5),
-                        blurRadius: 50,
-                        spreadRadius: 10,
-                      )
-                    ]
-                  : [],
-            ),
-            alignment: Alignment.center,
-            child: _isConnecting
-                ? const CircularProgressIndicator(color: AppTheme.neonCyan)
-                : Icon(
-                    Icons.power_settings_new,
-                    size: 80,
-                    color: isConnected
-                        ? AppTheme.neonCyan
-                        : Colors.white54,
-                  ),
-          ),
-        ),
-
-        const SizedBox(height: 20),
-        Text(
-          isConnected
-              ? 'متصل شد'
-              : (_isConnecting
-                  ? 'در حال اتصال...'
-                  : 'برای اتصال ضربه بزنید'),
-          style: TextStyle(
-            color: isConnected ? AppTheme.neonCyan : Colors.white70,
-            fontSize: 18,
-          ),
-        ),
-
-        // ── Latency badge — only visible when connected ───────────────────
-        if (isConnected)
-          Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 350),
-              switchInCurve: Curves.easeOutBack,
-              switchOutCurve: Curves.easeIn,
-              transitionBuilder: (child, animation) => FadeTransition(
-                opacity: animation,
-                child: ScaleTransition(scale: animation, child: child),
-              ),
-              child: _isMeasuringLatency
-                  ? _PingPill(
-                      key: const ValueKey('ping-measuring'),
-                      onTap: null,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: IntrinsicHeight(
+              child: Column(
+                children: [
+                  // ── Top Navbar toggles ───────────────────────────────────
+                  Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: GlassCard(
+                      height: 60,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: const [
-                          SizedBox(
-                            width: 12,
-                            height: 12,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 1.5,
-                              color: AppTheme.neonCyan,
+                        children: [
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: () => _handleModeSwitch(true),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 300),
+                                decoration: BoxDecoration(
+                                  color: isVpnMode
+                                      ? AppTheme.neonCyan
+                                          .withValues(alpha: 0.2)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                alignment: Alignment.center,
+                                child: Text(
+                                  'VPN (کل دستگاه)',
+                                  style: TextStyle(
+                                    color: isVpnMode
+                                        ? AppTheme.neonCyan
+                                        : Colors.white54,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
-                          SizedBox(width: 7),
-                          Text(
-                            'در حال سنجش...',
-                            style: TextStyle(
-                              color: AppTheme.neonCyan,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: () => _handleModeSwitch(false),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 300),
+                                decoration: BoxDecoration(
+                                  color: !isVpnMode
+                                      ? AppTheme.neonPurple
+                                          .withValues(alpha: 0.2)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                alignment: Alignment.center,
+                                child: Text(
+                                  'حالت پروکسی',
+                                  style: TextStyle(
+                                    color: !isVpnMode
+                                        ? AppTheme.neonPurple
+                                        : Colors.white54,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
                         ],
                       ),
-                    )
-                  : _bestNodeLatencyMs > 0
-                      ? _PingPill(
-                          key: ValueKey(
-                              'ping-result-$_bestNodeLatencyMs'),
-                          onTap: _refreshLatency,
-                          glowColor: _bestNodeLatencyMs < 120
+                    ),
+                  ),
+
+                  const Spacer(),
+
+                  // ── Connection Button (با قابلیت لغو در حین اتصال) ───────
+                  GestureDetector(
+                    onTap: _toggleConnection,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeInOut,
+                      width: 200,
+                      height: 200,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: AppTheme.oledDark,
+                        border: Border.all(
+                          color: isConnected
                               ? AppTheme.neonCyan
-                              : _bestNodeLatencyMs < 250
-                                  ? Colors.amber
-                                  : Colors.orange,
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                Icons.network_ping_rounded,
-                                size: 13,
-                                color: _bestNodeLatencyMs < 120
-                                    ? AppTheme.neonCyan
-                                    : _bestNodeLatencyMs < 250
-                                        ? Colors.amber
-                                        : Colors.orange,
-                              ),
-                              const SizedBox(width: 5),
-                              Text(
-                                '$_bestNodeLatencyMs میلی ثانیه',
-                                style: TextStyle(
-                                  color: _bestNodeLatencyMs < 120
-                                      ? AppTheme.neonCyan
-                                      : _bestNodeLatencyMs < 250
-                                          ? Colors.amber
-                                          : Colors.orange,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: 0.5,
+                              : (_isConnecting
+                                  ? AppTheme.neonPurple
+                                  : Colors.white24),
+                          width: 2.2,
+                        ),
+                        boxShadow: isConnected
+                            ? [
+                                BoxShadow(
+                                  color: AppTheme.neonCyan
+                                      .withValues(alpha: 0.5),
+                                  blurRadius: 50,
+                                  spreadRadius: 10,
+                                )
+                              ]
+                            : [],
+                      ),
+                      alignment: Alignment.center,
+                      child: _isConnecting
+                          ? Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                const SizedBox(
+                                  width: 84,
+                                  height: 84,
+                                  child: CircularProgressIndicator(
+                                    color: AppTheme.neonCyan,
+                                    strokeWidth: 3,
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                        )
-                      : _latencyProbeError
-                          ? _PingPill(
-                              key: const ValueKey('ping-error'),
-                              onTap: _refreshLatency,
-                              glowColor: Colors.redAccent,
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: const [
-                                  Icon(
-                                      Icons
-                                          .signal_wifi_statusbar_null_rounded,
-                                      size: 13,
-                                      color: Colors.redAccent),
-                                  SizedBox(width: 5),
-                                  Text(
-                                    'اتصال ضعیف — دوباره امتحان',
-                                    style: TextStyle(
-                                      color: Colors.redAccent,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
-                              ),
+                                const Icon(
+                                  Icons.close_rounded,
+                                  size: 36,
+                                  color: Colors.white70,
+                                ),
+                              ],
                             )
-                          : _PingPill(
-                              key: const ValueKey('ping-idle'),
-                              onTap: _refreshLatency,
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: const [
-                                  Icon(Icons.radar_rounded,
-                                      size: 13, color: Colors.white60),
-                                  SizedBox(width: 5),
-                                  Text(
-                                    'گرفتن پینگ',
-                                    style: TextStyle(
-                                      color: Colors.white60,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w500,
+                          : Icon(
+                              Icons.power_settings_new_rounded,
+                              size: 80,
+                              color: isConnected
+                                  ? AppTheme.neonCyan
+                                  : Colors.white54,
+                            ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+                  Text(
+                    isConnected
+                        ? 'متصل شد'
+                        : (_isConnecting
+                            ? 'در حال یافتن بهترین سرور... (برای لغو ضربه بزنید)'
+                            : 'برای اتصال ضربه بزنید'),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: isConnected ? AppTheme.neonCyan : Colors.white70,
+                      fontSize: _isConnecting ? 14 : 18,
+                      fontWeight:
+                          isConnected ? FontWeight.bold : FontWeight.normal,
+                    ),
+                  ),
+
+                  // ── Latency badge ────────────────────────────────────────
+                  if (isConnected)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 350),
+                        switchInCurve: Curves.easeOutBack,
+                        switchOutCurve: Curves.easeIn,
+                        transitionBuilder: (child, animation) =>
+                            FadeTransition(
+                          opacity: animation,
+                          child:
+                              ScaleTransition(scale: animation, child: child),
+                        ),
+                        child: _isMeasuringLatency
+                            ? _PingPill(
+                                key: const ValueKey('ping-measuring'),
+                                onTap: null,
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: const [
+                                    SizedBox(
+                                      width: 12,
+                                      height: 12,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 1.5,
+                                        color: AppTheme.neonCyan,
+                                      ),
                                     ),
-                                  ),
-                                ],
+                                    SizedBox(width: 7),
+                                    Text(
+                                      'در حال سنجش...',
+                                      style: TextStyle(
+                                        color: AppTheme.neonCyan,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              )
+                            : _bestNodeLatencyMs > 0
+                                ? _PingPill(
+                                    key: ValueKey(
+                                        'ping-result-$_bestNodeLatencyMs'),
+                                    onTap: _refreshLatency,
+                                    glowColor: _bestNodeLatencyMs < 120
+                                        ? AppTheme.neonCyan
+                                        : _bestNodeLatencyMs < 250
+                                            ? Colors.amber
+                                            : Colors.orange,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.network_ping_rounded,
+                                          size: 13,
+                                          color: _bestNodeLatencyMs < 120
+                                              ? AppTheme.neonCyan
+                                              : _bestNodeLatencyMs < 250
+                                                  ? Colors.amber
+                                                  : Colors.orange,
+                                        ),
+                                        const SizedBox(width: 5),
+                                        Text(
+                                          '$_bestNodeLatencyMs میلی‌ثانیه',
+                                          style: TextStyle(
+                                            color: _bestNodeLatencyMs < 120
+                                                ? AppTheme.neonCyan
+                                                : _bestNodeLatencyMs < 250
+                                                    ? Colors.amber
+                                                    : Colors.orange,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.bold,
+                                            letterSpacing: 0.5,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  )
+                                : _latencyProbeError
+                                    ? _PingPill(
+                                        key: const ValueKey('ping-error'),
+                                        onTap: _refreshLatency,
+                                        glowColor: Colors.redAccent,
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: const [
+                                            Icon(
+                                                Icons
+                                                    .signal_wifi_statusbar_null_rounded,
+                                                size: 13,
+                                                color: Colors.redAccent),
+                                            SizedBox(width: 5),
+                                            Text(
+                                              'اتصال ضعیف — تلاش مجدد',
+                                              style: TextStyle(
+                                                color: Colors.redAccent,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      )
+                                    : _PingPill(
+                                        key: const ValueKey('ping-idle'),
+                                        onTap: _refreshLatency,
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: const [
+                                            Icon(Icons.radar_rounded,
+                                                size: 13,
+                                                color: Colors.white60),
+                                            SizedBox(width: 5),
+                                            Text(
+                                              'گرفتن پینگ',
+                                              style: TextStyle(
+                                                color: Colors.white60,
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w500,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                      ),
+                    ),
+
+                  const Spacer(),
+
+                  // ── Premium Stats Progress Bars ──────────────────────────
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                    child: Column(
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text(
+                              'وضعیت اشتراک',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
                               ),
                             ),
+                            if (widget.onRefreshStats != null)
+                              InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                onTap: widget.isRefreshingStats
+                                    ? null
+                                    : () {
+                                        HapticFeedback.lightImpact();
+                                        widget.onRefreshStats!();
+                                      },
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 6, vertical: 2),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (widget.isRefreshingStats)
+                                        const SizedBox(
+                                          width: 12,
+                                          height: 12,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 1.5,
+                                            color: AppTheme.neonCyan,
+                                          ),
+                                        )
+                                      else
+                                        const Icon(
+                                          Icons.refresh_rounded,
+                                          size: 14,
+                                          color: AppTheme.neonCyan,
+                                        ),
+                                      const SizedBox(width: 4),
+                                      const Text(
+                                        'بروزرسانی',
+                                        style: TextStyle(
+                                          color: AppTheme.neonCyan,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+
+                        // ── Traffic bar ────────────────────────────────────
+                        _PremiumStatBar(
+                          label: 'ترافیک باقیمانده:',
+                          valueText: stats == null
+                              ? '—'
+                              : stats.isUnlimitedTraffic
+                                  ? 'نامحدود'
+                                  : '${stats.remainingTrafficGB.toStringAsFixed(2)} گیگابایت',
+                          isUnlimited: stats?.isUnlimitedTraffic ?? false,
+                          isDanger: stats != null &&
+                              !stats.isUnlimitedTraffic &&
+                              stats.trafficFraction <= 0.20,
+                          fraction: stats?.trafficFraction ?? 0.0,
+                        ),
+
+                        const SizedBox(height: 18),
+
+                        // ── Days bar (سازگار با بسته‌های ۳۰، ۶۰ و ۹۰ روزه) ──
+                        _PremiumStatBar(
+                          label: 'زمان باقیمانده:',
+                          valueText: stats == null
+                              ? '—'
+                              : stats.isUnlimitedTime
+                                  ? 'نامحدود'
+                                  : stats.isExpired
+                                      ? 'منقضی شده'
+                                      : '${stats.daysRemaining} روز',
+                          isUnlimited: stats?.isUnlimitedTime ?? false,
+                          isDanger: stats != null &&
+                              !stats.isUnlimitedTime &&
+                              (stats.isExpired || stats.daysRemaining <= 5),
+                          fraction: _computeDaysFraction(stats),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+
+                  // ── Support Button ───────────────────────────────────────
+                  TextButton.icon(
+                    onPressed: () => UrlLauncherUtils.launchTelegramSupport(),
+                    icon: const Icon(Icons.support_agent_rounded,
+                        color: AppTheme.neonCyan),
+                    label: const Text(
+                      'پشتیبانی تلگرام',
+                      style: TextStyle(color: AppTheme.neonCyan),
+                    ),
+                  ),
+
+                  const SizedBox(height: 110),
+                ],
+              ),
             ),
           ),
-
-        const Spacer(),
-
-        // ── Premium Stats Progress Bars ──────────────────────────────────
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24.0),
-          child: Column(
-            children: [
-              // ── Traffic bar ─────────────────────────────────────────────
-              _PremiumStatBar(
-                label: 'ترافیک باقیمانده:',
-                valueText: stats == null
-                    ? '—'
-                    : stats.isUnlimitedTraffic
-                        ? 'نامحدود'
-                        : '${stats.remainingTrafficGB.toStringAsFixed(2)} گیگابایت',
-                isUnlimited: stats?.isUnlimitedTraffic ?? false,
-                isDanger: stats != null &&
-                    !stats.isUnlimitedTraffic &&
-                    stats.trafficFraction <= 0.20,
-                fraction: stats?.trafficFraction ?? 0.0,
-              ),
-
-              const SizedBox(height: 18),
-
-              // ── Days bar ─────────────────────────────────────────────────
-              _PremiumStatBar(
-                label: 'روزهای باقیمانده:',
-                valueText: stats == null
-                    ? '—'
-                    : stats.isUnlimitedTime
-                        ? 'نامحدود روز'
-                        : stats.isExpired
-                            ? 'منقضی شده'
-                            : '${stats.daysRemaining} روز',
-                isUnlimited: stats?.isUnlimitedTime ?? false,
-                isDanger: stats != null &&
-                    !stats.isUnlimitedTime &&
-                    (stats.isExpired || stats.daysRemaining <= 5),
-                fraction: stats == null
-                    ? 0.0
-                    : stats.isUnlimitedTime
-                        ? 1.0
-                        : stats.isExpired
-                            ? 0.0
-                            : (stats.daysRemaining / 30.0)
-                                .clamp(0.0, 1.0),
-              ),
-            ],
-          ),
-        ),
-
-        const SizedBox(height: 24),
-
-        // ── Support Button ───────────────────────────────────────────────
-        TextButton.icon(
-          onPressed: () => UrlLauncherUtils.launchTelegramSupport(),
-          icon: const Icon(Icons.support_agent, color: AppTheme.neonCyan),
-          label: const Text('پشتیبانی',
-              style: TextStyle(color: AppTheme.neonCyan)),
-        ),
-
-        const SizedBox(height: 120),
-      ],
+        );
+      },
     );
   }
 }
@@ -1788,16 +2105,11 @@ class _HomeTabState extends ConsumerState<HomeTab> {
 // Premium Stat Bar Widget
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Cyberpunk-style progress bar with dynamic Safe/Danger zone color shifting.
 class _PremiumStatBar extends StatelessWidget {
   final String label;
   final String valueText;
   final bool isUnlimited;
-
-  /// Fraction in [0.0, 1.0]; 1.0 when unlimited.
   final double fraction;
-
-  /// Force the bar into danger (red) mode — e.g. expired or fully consumed.
   final bool isDanger;
 
   const _PremiumStatBar({
@@ -1826,7 +2138,6 @@ class _PremiumStatBar extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ── Label row ─────────────────────────────────────────────────────
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
@@ -1843,11 +2154,10 @@ class _PremiumStatBar extends StatelessWidget {
               style: TextStyle(
                 color: _barColor,
                 fontSize: 13,
-                fontWeight:
-                    isUnlimited ? FontWeight.bold : FontWeight.w600,
+                fontWeight: isUnlimited ? FontWeight.bold : FontWeight.w600,
                 shadows: [
                   Shadow(
-                    color: _barColor.withOpacity(0.8),
+                    color: _barColor.withValues(alpha: 0.8),
                     blurRadius: 8,
                   ),
                 ],
@@ -1856,10 +2166,7 @@ class _PremiumStatBar extends StatelessWidget {
             ),
           ],
         ),
-
         const SizedBox(height: 8),
-
-        // ── Bar track ─────────────────────────────────────────────────────
         LayoutBuilder(
           builder: (context, constraints) {
             final trackWidth = constraints.maxWidth;
@@ -1870,7 +2177,7 @@ class _PremiumStatBar extends StatelessWidget {
                 Container(
                   height: 7,
                   decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.05),
+                    color: Colors.white.withValues(alpha: 0.05),
                     borderRadius: BorderRadius.circular(99),
                   ),
                 ),
@@ -1886,7 +2193,7 @@ class _PremiumStatBar extends StatelessWidget {
                     borderRadius: BorderRadius.circular(99),
                     boxShadow: [
                       BoxShadow(
-                        color: _barColor.withOpacity(0.65),
+                        color: _barColor.withValues(alpha: 0.65),
                         blurRadius: 10,
                         spreadRadius: 1,
                       ),
@@ -1906,7 +2213,6 @@ class _PremiumStatBar extends StatelessWidget {
 // Ping Pill
 // ════════════════════════════════════════════════════════════════════════════
 
-/// A frosted-glass pill that wraps any child with a tap handler.
 class _PingPill extends StatelessWidget {
   final Widget child;
   final VoidCallback? onTap;
@@ -1927,15 +2233,15 @@ class _PingPill extends StatelessWidget {
         duration: const Duration(milliseconds: 300),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.07),
+          color: Colors.white.withValues(alpha: 0.07),
           borderRadius: BorderRadius.circular(99),
           border: Border.all(
-            color: glowColor.withOpacity(0.35),
+            color: glowColor.withValues(alpha: 0.35),
             width: 1,
           ),
           boxShadow: [
             BoxShadow(
-              color: glowColor.withOpacity(0.20),
+              color: glowColor.withValues(alpha: 0.20),
               blurRadius: 14,
               spreadRadius: 1,
             ),
