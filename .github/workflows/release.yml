@@ -285,7 +285,7 @@ jobs:
             dist/*.tar.gz
 
   # ==========================================
-  # 3. ANDROID BUILD (WITH LEGACY PLUGIN PATCHER)
+  # 3. ANDROID BUILD (WITH PYTHON PLUGIN PATCHER)
   # ==========================================
   build-android:
     name: Build Android (APKs)
@@ -320,31 +320,75 @@ jobs:
       - name: Install Dependencies
         run: flutter pub get
 
-      - name: Patch Legacy Android Plugins (jcenter & device_apps)
+      - name: Patch Legacy Android Plugins (jcenter, namespace & JVM 17)
         run: |
-          # ۱. جایگزینی مخزن حذف‌شده jcenter() با mavenCentral() در تمام پکیج‌های کش‌شده
-          find "$HOME/.pub-cache" -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) \
-            -exec sed -i 's/jcenter()/mavenCentral()/g' {} +
+          python3 - << 'EOF'
+          import os, re, glob
 
-          # ۲. اصلاح ساختار پکیج قدیمی device_apps برای سازگاری با AGP 8+ و Java 17
-          DEVICE_APPS_GRADLE=$(find "$HOME/.pub-cache" -path "*/device_apps*/android/build.gradle" | head -n 1)
-          if [ -n "$DEVICE_APPS_GRADLE" ]; then
-            echo "Patching $DEVICE_APPS_GRADLE..."
-            # ارتقای compileSdkVersion به 35
-            sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 35/g' "$DEVICE_APPS_GRADLE"
+          pub_cache = os.environ.get('PUB_CACHE', os.path.expanduser('~/.pub-cache'))
+          print(f"Scanning PUB_CACHE at: {pub_cache}")
 
-            # تزریق namespace و هماهنگ‌سازی JVM Target با Java 17 در صورتی که قبلاً اضافه نشده باشد
-            if ! grep -q "namespace" "$DEVICE_APPS_GRADLE"; then
-              sed -i 's/android {/android {\n    namespace "fr.g123k.deviceapps"\n    compileOptions {\n        sourceCompatibility JavaVersion.VERSION_17\n        targetCompatibility JavaVersion.VERSION_17\n    }\n    kotlinOptions {\n        jvmTarget = "17"\n    }/g' "$DEVICE_APPS_GRADLE"
-            fi
-          fi
+          # 1. Replace jcenter() with mavenCentral() across all cached plugins
+          for root, _, files in os.walk(pub_cache):
+              for f in files:
+                  if f in ('build.gradle', 'build.gradle.kts'):
+                      p = os.path.join(root, f)
+                      with open(p, 'r', encoding='utf-8', errors='ignore') as file:
+                          content = file.read()
+                      if 'jcenter()' in content:
+                          content = content.replace('jcenter()', 'mavenCentral()')
+                          with open(p, 'w', encoding='utf-8') as file:
+                              file.write(content)
+                          print(f"[FIXED] Replaced jcenter() in {p}")
 
-          # ۳. حذف صفت قدیمی package از AndroidManifest.xml پکیج device_apps
-          DEVICE_APPS_MANIFEST=$(find "$HOME/.pub-cache" -path "*/device_apps*/android/src/main/AndroidManifest.xml" | head -n 1)
-          if [ -n "$DEVICE_APPS_MANIFEST" ]; then
-            echo "Patching $DEVICE_APPS_MANIFEST..."
-            sed -i 's/package="fr.g123k.deviceapps"//g' "$DEVICE_APPS_MANIFEST"
-          fi
+          # 2. Inject missing namespace and JVM 17 compatibility into legacy plugins
+          for manifest_path in glob.glob(f"{pub_cache}/hosted/pub.dev/*/android/src/main/AndroidManifest.xml"):
+              android_dir = os.path.dirname(os.path.dirname(os.path.dirname(manifest_path)))
+              gradle_path = os.path.join(android_dir, "build.gradle")
+              if not os.path.exists(gradle_path):
+                  continue
+
+              with open(manifest_path, 'r', encoding='utf-8', errors='ignore') as f:
+                  manifest = f.read()
+
+              m = re.search(r'package\s*=\s*["\']([^"\']+)["\']', manifest)
+              pkg_name = m.group(1) if m else None
+              if not pkg_name and 'device_apps' in android_dir:
+                  pkg_name = 'fr.g123k.deviceapps'
+
+              if pkg_name and 'package=' in manifest:
+                  manifest_cleaned = re.sub(r'\s*package\s*=\s*["\'][^"\']+["\']', '', manifest, count=1)
+                  with open(manifest_path, 'w', encoding='utf-8') as f:
+                      f.write(manifest_cleaned)
+                  print(f"[FIXED] Removed package attribute ({pkg_name}) from {manifest_path}")
+
+              with open(gradle_path, 'r', encoding='utf-8', errors='ignore') as f:
+                  gradle = f.read()
+
+              if 'namespace' not in gradle and pkg_name:
+                  inject_block = f'\n    namespace = "{pkg_name}"\n    compileSdkVersion 35\n'
+                  if 'kotlin-android' in gradle and 'jvmTarget' not in gradle:
+                      inject_block += (
+                          '    compileOptions {\n'
+                          '        sourceCompatibility = JavaVersion.VERSION_17\n'
+                          '        targetCompatibility = JavaVersion.VERSION_17\n'
+                          '    }\n'
+                          '    kotlinOptions {\n'
+                          '        jvmTarget = "17"\n'
+                          '    }\n'
+                      )
+                  gradle_patched, count = re.subn(
+                      r'android\s*\{',
+                      f'android {{{inject_block}',
+                      gradle,
+                      count=1
+                  )
+                  if count == 0:
+                      gradle_patched = gradle + f'\nandroid {{{inject_block}}}\n'
+                  with open(gradle_path, 'w', encoding='utf-8') as f:
+                      f.write(gradle_patched)
+                  print(f"[FIXED] Injected namespace '{pkg_name}' into {gradle_path}")
+          EOF
 
       - name: Build Split & Universal APKs
         run: |
