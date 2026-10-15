@@ -62,7 +62,7 @@ jobs:
       - name: Create Inno Setup Script & Build Installer
         shell: pwsh
         run: |
-          $AppExe = (Get-ChildItem -Path "build\windows\x64\runner\Release\*.exe" | Select-Object -First 1).Name
+          $AppExe = (Get-ChildItem -Path "build\windows\x64\runner\Release\candyconnect.exe" | Select-Object -First 1).Name
           if (-not $AppExe) { $AppExe = "candyconnect.exe" }
 
           $IssScript = @"
