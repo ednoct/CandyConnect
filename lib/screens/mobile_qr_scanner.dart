@@ -1,9 +1,11 @@
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:zxing2/qrcode.dart' hide BarcodeFormat;
+import 'package:zxing2/qrcode.dart';
 import 'package:image/image.dart' as img;
 import '../theme/app_theme.dart';
 
@@ -15,7 +17,7 @@ Future<String?> decodeQrFromBytesIsolate(Uint8List bytes) async {
       var image = img.decodeImage(bytes);
       if (image == null) return null;
 
-      // بهینه‌سازی ابعاد تصاویر بزرگ برای افزایش ۱۰ برابری سرعت پردازش
+      // بهینه‌سازی ابعاد تصاویر بزرگ گالری برای افزایش ۱۰ برابری سرعت پردازش
       if (image.width > 1200 || image.height > 1200) {
         image = img.copyResize(
           image,
@@ -61,8 +63,10 @@ class _MobileQRScannerScreenState extends State<MobileQRScannerScreen> {
     detectionSpeed: DetectionSpeed.noDuplicates,
     formats: const [BarcodeFormat.qrCode],
   );
+  final ImagePicker _imagePicker = ImagePicker();
 
   bool _isProcessing = false;
+  bool _isAnalyzingGallery = false;
   bool _torchEnabled = false;
 
   @override
@@ -72,7 +76,7 @@ class _MobileQRScannerScreenState extends State<MobileQRScannerScreen> {
   }
 
   void _onDetect(BarcodeCapture capture) {
-    if (_isProcessing) return;
+    if (_isProcessing || _isAnalyzingGallery) return;
 
     final List<Barcode> barcodes = capture.barcodes;
     if (barcodes.isNotEmpty) {
@@ -81,6 +85,79 @@ class _MobileQRScannerScreenState extends State<MobileQRScannerScreen> {
         _isProcessing = true;
         HapticFeedback.mediumImpact();
         Navigator.pop(context, rawValue);
+      }
+    }
+  }
+
+  /// انتخاب تصویر بارکد از گالری با پشتیبانی دوگانه (MLKit + ZXing2 Fallback)
+  Future<void> _pickFromGallery() async {
+    if (_isProcessing || _isAnalyzingGallery) return;
+
+    try {
+      HapticFeedback.lightImpact();
+      final XFile? pickedFile = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+      );
+
+      if (pickedFile == null || !mounted) return;
+
+      setState(() => _isAnalyzingGallery = true);
+
+      String? extractedCode;
+
+      // تلاش اول: استفاده از موتور بومی MobileScanner
+      try {
+        final BarcodeCapture? capture =
+            await _scannerController.analyzeImage(pickedFile.path);
+        if (capture != null && capture.barcodes.isNotEmpty) {
+          extractedCode = capture.barcodes.first.rawValue?.trim();
+        }
+      } catch (_) {
+        // در صورت عدم پشتیبانی دستگاه از Google MLKit، به موتور دوم می‌رویم
+      }
+
+      // تلاش دوم (پشتیبان قطعی): دیکود در ایزوله پس‌زمینه با ZXing2
+      if (extractedCode == null || extractedCode.isEmpty) {
+        final bytes = await File(pickedFile.path).readAsBytes();
+        extractedCode = await decodeQrFromBytesIsolate(bytes);
+      }
+
+      if (!mounted) return;
+
+      if (extractedCode != null && extractedCode.isNotEmpty) {
+        _isProcessing = true;
+        HapticFeedback.heavyImpact();
+        Navigator.pop(context, extractedCode);
+      } else {
+        setState(() => _isAnalyzingGallery = false);
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              'هیچ کد QR معتبری در تصویر انتخابی یافت نشد!',
+              style: TextStyle(color: Colors.white, fontFamily: 'Vazirmatn'),
+            ),
+            backgroundColor: AppTheme.errorRed,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isAnalyzingGallery = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              'خطا در خواندن تصویر از گالری',
+              style: TextStyle(color: Colors.white, fontFamily: 'Vazirmatn'),
+            ),
+            backgroundColor: AppTheme.errorRed,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
       }
     }
   }
@@ -144,6 +221,29 @@ class _MobileQRScannerScreenState extends State<MobileQRScannerScreen> {
                   ),
                 ],
               ),
+              child: _isAnalyzingGallery
+                  ? Container(
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.75),
+                        borderRadius: BorderRadius.circular(21),
+                      ),
+                      child: const Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          CircularProgressIndicator(color: AppTheme.neonCyan),
+                          SizedBox(height: 12),
+                          Text(
+                            'در حال استخراج بارکد از تصویر...',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontFamily: 'Vazirmatn',
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  : null,
             ),
           ),
 
@@ -195,17 +295,16 @@ class _MobileQRScannerScreenState extends State<MobileQRScannerScreen> {
             ),
           ),
 
-          // ── بخش پایینی: راهنمای اسکن ──────────────────────────────────────
-          const Positioned(
+          // ── بخش پایینی: راهنما + دکمه انتخاب بارکد از گالری ──────────────
+          Positioned(
             bottom: 48,
             left: 24,
             right: 24,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
+                const Text(
                   'کد QR لایسنس را در کادر قرار دهید',
-                  textAlign: TextAlign.center,
                   style: TextStyle(
                     color: Colors.white,
                     fontWeight: FontWeight.bold,
@@ -213,14 +312,39 @@ class _MobileQRScannerScreenState extends State<MobileQRScannerScreen> {
                     fontFamily: 'Vazirmatn',
                   ),
                 ),
-                SizedBox(height: 8),
-                Text(
-                  'بارکد به صورت خودکار و فوق سریع شناسایی می‌شود',
-                  textAlign: TextAlign.center,
+                const SizedBox(height: 8),
+                const Text(
+                  'یا تصویر بارکد ذخیره‌شده را از گالری انتخاب کنید',
                   style: TextStyle(
                     color: Colors.white70,
                     fontSize: 13,
                     fontFamily: 'Vazirmatn',
+                  ),
+                ),
+                const SizedBox(height: 20),
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton.icon(
+                    onPressed: _isAnalyzingGallery ? null : _pickFromGallery,
+                    icon: const Icon(Icons.photo_library_rounded,
+                        color: Colors.black, size: 22),
+                    label: const Text(
+                      'انتخاب تصویر بارکد از گالری',
+                      style: TextStyle(
+                        color: Colors.black,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                        fontFamily: 'Vazirmatn',
+                      ),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.neonCyan,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      elevation: 8,
+                    ),
                   ),
                 ),
               ],

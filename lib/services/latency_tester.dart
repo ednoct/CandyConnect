@@ -208,7 +208,6 @@ class LatencyTester {
 
       try {
         final result = await _measureAll(nodes);
-        // ── Bug Fix: بررسی دوباره _running پس از await ───────────────────────────
         if (!_running || result == null || result.isEmpty) return;
 
         final current = currentNodeGetter?.call();
@@ -224,12 +223,11 @@ class LatencyTester {
           }
         }
 
-        // ── Bug Fix: guard before callback (stop() might have been called) ──
-        if (_running && result.first.isReachable) {
+        if (result.first.isReachable) {
           onBestNodeFound(result.first);
         }
       } finally {
-        _roundInProgress = false;  // این خط حتی بعد از stop() هم اجرا می‌شود
+        _roundInProgress = false;
       }
     }
 

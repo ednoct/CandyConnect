@@ -1,5 +1,3 @@
-// ignore_for_file: constant_identifier_names
-
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';

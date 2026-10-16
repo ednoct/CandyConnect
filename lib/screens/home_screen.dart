@@ -34,11 +34,10 @@ WintunFFI get _wintunFFI => _wintunInstance ??= WintunFFI();
 WinDivertFFI get _winDivertFFI => _winDivertInstance ??= WinDivertFFI();
 
 /// تابع کمکی سراسری برای توقف ایمن و کامل تمام لایه‌های تونل و هسته در همه پلتفرم‌ها
-Future<void> safeStopAllTunnels() async {
+Future<void> _safeStopAllTunnels() async {
   if (Platform.isWindows) {
     try {
       _winDivertFFI.close();
-      await _wintunFFI.cleanupRouting();
       _wintunFFI.close();
     } catch (_) {}
   } else if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
@@ -47,17 +46,10 @@ Future<void> safeStopAllTunnels() async {
       await vpnChannel.invokeMethod('stopVpn');
     } catch (_) {}
   }
-  if (DesktopManager().isDesktop) {
-    try {
-      await DesktopManager().applySystemProxy(enable: false);
-    } catch (_) {}
-  }
   try {
     await XrayBridge.stopXray();
   } catch (_) {}
 }
-
-Future<void> _safeStopAllTunnels() => safeStopAllTunnels();
 
 // ════════════════════════════════════════════════════════════════════════════
 // Main Screen
@@ -96,7 +88,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     super.dispose();
   }
 
-  // ── Stats fetcher ─────────────────────────────────────────────────────────
+  // ── Stats fetcher (مجهز به آدرس‌های پشتیبان Failover) ─────────────────────
 
   Future<void> _fetchStats() async {
     if (_isRefreshingStats) return;
@@ -117,17 +109,16 @@ class _MainScreenState extends ConsumerState<MainScreen> {
       final subService = SubscriptionService(
         config.apiEndpoints.baseJsonSubUrl,
         statsUrl,
-        // ── Bug Fix: فیلیست Failover آماری به سرویس منتقل می‌شود ──────────
+        failoverSubUrls: config.apiEndpoints.failoverApiUrls,
         failoverStatsUrls: config.apiEndpoints.baseSubsStatsUrl.length > 1
             ? config.apiEndpoints.baseSubsStatsUrl.sublist(1)
             : const [],
-        failoverSubUrls: config.apiEndpoints.failoverApiUrls,
       );
 
       final stats = await subService.fetchStats(license);
 
       if (stats != null && mounted) {
-        ref.read(subscriptionStatsProvider.notifier).set(stats);
+        ref.read(subscriptionStatsProvider.notifier).state = stats;
       }
     } catch (e, st) {
       debugPrint('[MainScreen._fetchStats] unhandled exception: $e\n$st');
@@ -167,7 +158,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
           final isConnected = ref.read(isConnectedProvider);
           if (isConnected) {
             debugPrint('[MainScreen] Subscription expired! Force stopping.');
-            ref.read(isConnectedProvider.notifier).set(false);
+            ref.read(isConnectedProvider.notifier).state = false;
             _safeStopAllTunnels();
           }
         }
@@ -228,7 +219,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                   onTap: (index) {
                     if (navIndex != index) {
                       HapticFeedback.selectionClick();
-                      ref.read(navIndexProvider.notifier).set(index);
+                      ref.read(navIndexProvider.notifier).state = index;
                     }
                   },
                   items: const [
@@ -253,8 +244,9 @@ class _MainScreenState extends ConsumerState<MainScreen> {
               right: 20,
               child: _PromoBanner(
                 promo: config.promotions,
+                botHandle: config.clientPreferences.telegramBotHandle,
                 onDismiss: () =>
-                    ref.read(isPromoDismissedProvider.notifier).set(true),
+                    ref.read(isPromoDismissedProvider.notifier).state = true,
               ),
             ),
 
@@ -466,6 +458,9 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
 
   @override
   Widget build(BuildContext context) {
+    final botHandle =
+        ref.watch(remoteConfigProvider)?.clientPreferences.telegramBotHandle;
+
     return Positioned.fill(
       child: Container(
         color: AppTheme.oledDark,
@@ -536,15 +531,26 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                           final prefs = await SharedPreferences.getInstance();
                           await prefs.remove('license_key');
 
+                          if (DesktopManager().isDesktop) {
+                            await DesktopManager().applySystemProxy(
+                              enable: false,
+                            );
+                            await DesktopManager().updateTrayIcon(false);
+                          }
+
                           final isConnected = ref.read(isConnectedProvider);
                           if (isConnected) {
                             await _safeStopAllTunnels();
-                            ref.read(isConnectedProvider.notifier).set(false);
+                            ref.read(isConnectedProvider.notifier).state =
+                                false;
                           }
 
-                          ref.read(currentLicenseProvider.notifier).set(null);
-                          ref.read(subscriptionJsonProvider.notifier).set(null);
-                          ref.read(subscriptionStatsProvider.notifier).set(null);
+                          ref.read(currentLicenseProvider.notifier).state =
+                              null;
+                          ref.read(subscriptionJsonProvider.notifier).state =
+                              null;
+                          ref.read(subscriptionStatsProvider.notifier).state =
+                              null;
 
                           if (context.mounted) {
                             Navigator.pushAndRemoveUntil(
@@ -564,7 +570,9 @@ class _ExpirationOverlayState extends ConsumerState<_ExpirationOverlay> {
                         label: 'خرید / تمدید',
                         icon: Icons.shopping_cart_checkout_rounded,
                         onPressed: () =>
-                            UrlLauncherUtils.launchTelegramSupport(),
+                            UrlLauncherUtils.launchTelegramSupport(
+                          customHandle: botHandle,
+                        ),
                       ),
                     ),
                   ],
@@ -686,13 +694,19 @@ class _ExpirationOutlineButton extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Promo Banner (با بازخورد بصری کپی کد تخفیف)
+// Promo Banner
 // ════════════════════════════════════════════════════════════════════════════
 
 class _PromoBanner extends StatefulWidget {
   final PromotionConfig promo;
+  final String? botHandle;
   final VoidCallback onDismiss;
-  const _PromoBanner({required this.promo, required this.onDismiss});
+
+  const _PromoBanner({
+    required this.promo,
+    this.botHandle,
+    required this.onDismiss,
+  });
 
   @override
   State<_PromoBanner> createState() => _PromoBannerState();
@@ -708,6 +722,17 @@ class _PromoBannerState extends State<_PromoBanner> {
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) setState(() => _copied = false);
     });
+  }
+
+  void _handleTargetAction() {
+    if (widget.promo.targetAction == 'open_telegram') {
+      UrlLauncherUtils.launchTelegramSupport(customHandle: widget.botHandle);
+    } else if (widget.promo.targetAction.startsWith('http')) {
+      launchUrl(
+        Uri.parse(widget.promo.targetAction),
+        mode: LaunchMode.externalApplication,
+      );
+    }
   }
 
   @override
@@ -728,20 +753,26 @@ class _PromoBannerState extends State<_PromoBanner> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Row(
             children: [
-              const Icon(Icons.local_offer_rounded,
-                  color: AppTheme.neonPurple, size: 28),
+              GestureDetector(
+                onTap: _handleTargetAction,
+                child: const Icon(Icons.local_offer_rounded,
+                    color: AppTheme.neonPurple, size: 28),
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      widget.promo.title,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                        color: Colors.white,
+                    GestureDetector(
+                      onTap: _handleTargetAction,
+                      child: Text(
+                        widget.promo.title,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                          color: Colors.white,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 4),
@@ -930,42 +961,31 @@ class _HomeTabState extends ConsumerState<HomeTab> {
 
   @override
   void dispose() {
+    if (DesktopManager().isDesktop) {
+      DesktopManager().onToggleConnectionRequested = null;
+      DesktopManager().onBeforeExitCleanup = null;
+      DesktopManager().onModeChanged = null;
+    }
     _latencyTester.stop();
-    _connectionOptimizer.cancelSync(); // dispose() است همزمان — از نسخه sync استفاده می‌کنیم
-    // ── آزادسازی کالبک‌های DesktopManager برای جلوگیری از leak ──────────────
-    final dm = DesktopManager();
-    if (dm.onToggleConnectionRequested != null) {
-      dm.onToggleConnectionRequested = null;
-    }
-    if (dm.onModeChanged != null) {
-      dm.onModeChanged = null;
-    }
-    if (dm.onBeforeExitCleanup != null) {
-      dm.onBeforeExitCleanup = null;
-    }
+    _connectionOptimizer.cancel();
     super.dispose();
   }
 
   @override
   void initState() {
     super.initState();
-    // ── Bug Fix: اتصال کالبک‌های منوی Tray به HomeTabState ─────────────────
-    final dm = DesktopManager();
-    dm.onToggleConnectionRequested = () {
-      if (mounted) _toggleConnection();
-    };
-    dm.onModeChanged = (mode) {
-      if (!mounted) return;
-      final targetVpn = mode == DesktopRoutingMode.tunnelVpn;
-      final targetSysProxy = mode == DesktopRoutingMode.proxySystem;
-      ref.read(isVpnModeProvider.notifier).set(targetVpn);
-      ref.read(isSystemProxyProvider.notifier).set(targetSysProxy);
-    };
-    dm.onBeforeExitCleanup = () async {
-      if (ref.read(isConnectedProvider)) {
-        await _safeStopAllTunnels();
-      }
-    };
+
+    // ── اتصال مستقیم منوی Tray دسکتاپ به کنترل‌های HomeTab و Providers ──────
+    if (DesktopManager().isDesktop) {
+      DesktopManager().onToggleConnectionRequested = _toggleConnection;
+      DesktopManager().onBeforeExitCleanup = _safeStopAllTunnels;
+      DesktopManager().onModeChanged = (mode) {
+        if (!mounted) return;
+        ref.read(desktopSystemProxyProvider.notifier).state =
+            (mode == DesktopRoutingMode.proxySystem);
+        _handleModeSwitch(mode == DesktopRoutingMode.tunnelVpn);
+      };
+    }
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final license = ref.read(currentLicenseProvider);
@@ -996,34 +1016,14 @@ class _HomeTabState extends ConsumerState<HomeTab> {
           config.apiEndpoints.baseSubsStatsUrl.isNotEmpty
               ? config.apiEndpoints.baseSubsStatsUrl.first
               : '',
-          // ── Bug Fix: Failover URLs برای دریافت اشتراک ──────────────────
           failoverSubUrls: config.apiEndpoints.failoverApiUrls,
           failoverStatsUrls: config.apiEndpoints.baseSubsStatsUrl.length > 1
               ? config.apiEndpoints.baseSubsStatsUrl.sublist(1)
               : const [],
         );
-        var sub = await subService.fetchSubscription(license);
-
-        // پشتیبان اضطراری در صورت مسدود بودن تمام دامنه‌های اشتراک
-        if (sub == null &&
-            config.emergencyAccess.enableHardcodedFallback &&
-            config.emergencyAccess.fallbackNodes.isNotEmpty) {
-          final fallbackList = <dynamic>[];
-          for (final raw in config.emergencyAccess.fallbackNodes) {
-            try {
-              final parsed = jsonDecode(raw);
-              if (parsed is Map) fallbackList.add(parsed);
-            } catch (_) {
-              fallbackList.add({'address': raw, 'port': 443});
-            }
-          }
-          if (fallbackList.isNotEmpty) {
-            sub = fallbackList;
-          }
-        }
-
+        final sub = await subService.fetchSubscription(license);
         if (sub != null && mounted) {
-          ref.read(subscriptionJsonProvider.notifier).set(sub);
+          ref.read(subscriptionJsonProvider.notifier).state = sub;
         }
       }
       if (!mounted) return;
@@ -1057,19 +1057,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         if (!isConnected || _isConnecting) return;
         if (best.node == _currentNode) return;
 
-        // بررسی سقف مجاز پینگ جهت اتصال مجدد خودکار (Auto Reconnect)
-        final threshold =
-            config?.networkProbes.autoReconnectPingThresholdMs ?? 0;
-        final bool isHighPing = threshold > 0 &&
-            _currentNodeLatencyMs > threshold &&
-            best.latencyMs > 0 &&
-            best.latencyMs < threshold;
-
-        // جلوگیری از قطع و وصل بی‌مورد در نوسان‌های جزئی پینگ:
-        // فقط زمانی نود را در پس‌زمینه عوض کن که پینگ بالاتر از آستانه اضطراری باشد،
-        // نود فعلی قطع شده باشد یا نود جدید حداقل ۴۰ میلی‌ثانیه و ۳۰٪ سریع‌تر باشد.
-        final bool shouldSwitch = isHighPing ||
-            _currentNodeLatencyMs <= 0 ||
+        final bool shouldSwitch = _currentNodeLatencyMs <= 0 ||
             (best.latencyMs > 0 &&
                 (_currentNodeLatencyMs - best.latencyMs) >= 40 &&
                 best.latencyMs < (_currentNodeLatencyMs * 0.7));
@@ -1077,7 +1065,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         if (!shouldSwitch) return;
 
         debugPrint('[LatencyTester] Switching to significantly better node '
-            '(${best.latencyMs}ms vs current ${_currentNodeLatencyMs}ms, highPing=$isHighPing)');
+            '(${best.latencyMs}ms vs current ${_currentNodeLatencyMs}ms)');
         _currentNodeLatencyMs = best.latencyMs;
         _connectNode(best.node);
       },
@@ -1131,30 +1119,27 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     }
   }
 
-  // ── Mode Switcher Handler (هماهنگ با SettingsTab) ─────────────────────────
+  // ── Mode Switcher Handler ─────────────────────────────────────────────────
 
   Future<void> _handleModeSwitch(bool targetVpnMode) async {
     final currentMode = ref.read(isVpnModeProvider);
     if (currentMode == targetVpnMode) return;
 
     HapticFeedback.selectionClick();
-    ref.read(isVpnModeProvider.notifier).set(targetVpnMode);
+    ref.read(isVpnModeProvider.notifier).state = targetVpnMode;
+
     if (DesktopManager().isDesktop) {
-      if (targetVpnMode) {
-        ref.read(isSystemProxyProvider.notifier).set(false);
-        await DesktopManager().applySystemProxy(enable: false);
-      }
+      final sysProxy = ref.read(desktopSystemProxyProvider);
       await DesktopManager().updateTrayIcon(
         ref.read(isConnectedProvider),
         mode: targetVpnMode
             ? DesktopRoutingMode.tunnelVpn
-            : (ref.read(isSystemProxyProvider)
+            : (sysProxy
                 ? DesktopRoutingMode.proxySystem
                 : DesktopRoutingMode.proxyLocal),
       );
     }
 
-    // اگر در حال حاضر متصل هستیم، برای جلوگیری از عدم تطابق تونل، اتصال را با حالت جدید بازسازی کن
     final isConnected = ref.read(isConnectedProvider);
     if (isConnected && !_isConnecting && _currentNode != null) {
       await _connectNode(_currentNode);
@@ -1172,7 +1157,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     if (_isConnecting) {
       debugPrint('[_toggleConnection] Aborting in-flight connection attempt.');
       _abortRequested = true;
-      _connectionOptimizer.cancelSync(); // لغو فوری — نیازی به await نیست
+      await _connectionOptimizer.cancel();
       if (mounted) {
         setState(() {
           _isConnecting = false;
@@ -1180,14 +1165,14 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         });
       }
       await _safeStopAllTunnels();
-      ref.read(isConnectedProvider.notifier).set(false);
+      ref.read(isConnectedProvider.notifier).state = false;
       return;
     }
 
     // ── ۲. منطق قطع اتصال (DISCONNECT LOGIC) ──
     if (isConnected) {
       debugPrint('[_toggleConnection] Disconnect initiated.');
-      ref.read(isConnectedProvider.notifier).set(false);
+      ref.read(isConnectedProvider.notifier).state = false;
       _currentNode = null;
       _currentNodeLatencyMs = -1;
       _lastOptimizedResult = null;
@@ -1198,7 +1183,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         });
       }
 
-      _connectionOptimizer.cancelSync();
+      await _connectionOptimizer.cancel();
       await _safeStopAllTunnels();
       return;
     }
@@ -1206,7 +1191,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     // ── ۳. منطق اتصال (CONNECT LOGIC) ──
     if (Platform.isWindows && isVpnMode) {
       if (!ElevationUtils.isElevated()) {
-        ElevationUtils.relaunchElevated(['--auto-connect-vpn']);
+        await ElevationUtils.relaunchElevated(['--auto-connect-vpn']);
         return;
       }
     }
@@ -1216,7 +1201,8 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('در حال دریافت اطلاعات سرورها، لطفاً چند لحظه صبر کنید...'),
+            content: Text(
+                'در حال دریافت اطلاعات سرورها، لطفاً چند لحظه صبر کنید...'),
             backgroundColor: Colors.orange,
           ),
         );
@@ -1224,7 +1210,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       return;
     }
 
-    _abortRequested = false;      // Reset BEFORE setState to prevent micro-gap
+    _abortRequested = false;
     setState(() => _isConnecting = true);
 
     // ── Phase 1 (TCP): Race all nodes via TCP handshake ───────────────────
@@ -1298,28 +1284,29 @@ class _HomeTabState extends ConsumerState<HomeTab> {
   Future<void> _connectNode(dynamic rawNode) async {
     if (rawNode is! Map<String, dynamic>) return;
 
-    // ── عمیق‌کلونی ایمن برای جلوگیری از تغییر ناخواسته نود اصلی ────────────────────
-    Map<String, dynamic> node;
-    try {
-      node = Map<String, dynamic>.from(
-        jsonDecode(jsonEncode(rawNode)) as Map<String, dynamic>,
-      );
-    } catch (_) {
-      // fallback: shallow copy (safe since we only add/overwrite top-level keys)
-      node = Map<String, dynamic>.from(rawNode);
+    if (mounted && !_isConnecting) {
+      setState(() => _isConnecting = true);
     }
+
+    final node = Map<String, dynamic>.from(
+      jsonDecode(jsonEncode(rawNode)) as Map<String, dynamic>,
+    );
 
     _currentNode = rawNode;
 
     final isConnected = ref.read(isConnectedProvider);
     final isVpnMode = ref.read(isVpnModeProvider);
+    final config = ref.read(remoteConfigProvider);
 
     if (isConnected) {
-      ref.read(isConnectedProvider.notifier).set(false);
+      ref.read(isConnectedProvider.notifier).state = false;
       await _safeStopAllTunnels();
     }
 
-    if (_abortRequested || !mounted) return;
+    if (_abortRequested || !mounted) {
+      if (mounted) setState(() => _isConnecting = false);
+      return;
+    }
 
     if (Platform.isAndroid && isVpnMode) {
       const vpnChannel = MethodChannel('candyconnect/vpn');
@@ -1427,6 +1414,14 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         }
       }
 
+      // تضمین ارسال صرفاً آدرس‌های IPv4 معتبر به آداپتور TUN ویندوز (در صورت برنده شدن DoH)
+      final List<String> tunDnsList =
+          (optimized != null && DnsManager.isIpv4Address(optimized.remoteDns))
+              ? <String>{optimized.remoteDns, "1.1.1.1", "8.8.8.8"}
+                  .take(2)
+                  .toList()
+              : ["1.1.1.1", "8.8.8.8"];
+
       node['inbounds'] = [
         {
           "tag": "tun-in",
@@ -1436,9 +1431,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
             "desc": "CandyConnectVPN",
             "mtu": 1500,
             "gateway": ["10.0.0.1/16", "fc00::1/64"],
-            "dns": optimized != null
-                ? [optimized.remoteDns, optimized.remoteDns]
-                : ["1.1.1.1", "8.8.8.8"],
+            "dns": tunDnsList,
             "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
             "autoOutboundsInterface": "auto"
           },
@@ -1473,8 +1466,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       ];
     }
 
-    // ── Universal Geo-Routing & Split-Tunneling Asset Injection ───────────
-    final config = ref.read(remoteConfigProvider);
+    // ── Universal Geo-Routing & Split-Tunneling Injection ──────────────────
     String? geoAssetDir;
     try {
       geoAssetDir = await XrayBridge.ensureRoutingAssets();
@@ -1485,113 +1477,64 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     if (geoAssetDir != null) {
       node.putIfAbsent('env', () => <String, dynamic>{});
       (node['env'] as Map)['xray.location.asset'] = geoAssetDir;
-    }
 
-    // تزریق قوانین تقسیم ترافیک (Split Tunneling) و مسدودسازی تبلیغات از RemoteConfig
-    node.putIfAbsent('routing', () => <String, dynamic>{});
-    final routingMap = node['routing'] as Map<String, dynamic>;
-    final existingRules =
-        List<dynamic>.from(routingMap['rules'] as List? ?? []);
-    final splitRules = <Map<String, dynamic>>[];
+      node.putIfAbsent('routing', () => <String, dynamic>{});
+      final routingMap = node['routing'] as Map<String, dynamic>;
+      final existingRules =
+          List<dynamic>.from(routingMap['rules'] as List? ?? []);
 
-    final split = config?.splitTunneling;
-    final bypassDomestic = split?.bypassDomesticTraffic ?? true;
-    final directDomains = split?.directDomains ?? <String>[];
-    final blockAds = split?.blockAdsAndTrackers ?? false;
-    final blockedDomains = split?.blockedDomains ?? <String>[];
+      final splitConfig = config?.splitTunneling;
+      final bypassDomestic = splitConfig?.bypassDomesticTraffic ?? true;
+      final blockAds = splitConfig?.blockAdsAndTrackers ?? false;
 
-    // مسدودسازی تبلیغات و دامنه‌های مخرب
-    if (blockAds) {
-      splitRules.add({
-        'type': 'field',
-        'domain': ['geosite:category-ads-all', ...blockedDomains],
-        'outboundTag': 'block',
-      });
-    } else if (blockedDomains.isNotEmpty) {
-      splitRules.add({
-        'type': 'field',
-        'domain': blockedDomains,
-        'outboundTag': 'block',
-      });
-    }
+      final injectedRules = <Map<String, dynamic>>[
+        {
+          'type': 'field',
+          'ip': ['geoip:private'],
+          'outboundTag': 'direct',
+        },
+      ];
 
-    // هدایت مستقیم سایت‌های داخلی و بانکی
-    final directList = <String>[];
-    if (bypassDomestic) {
-      directList.add('geosite:ir');
-    }
-    directList.addAll(directDomains);
-
-    if (directList.isNotEmpty) {
-      splitRules.add({
-        'type': 'field',
-        'domain': directList,
-        'outboundTag': 'direct',
-      });
-    }
-
-    if (bypassDomestic) {
-      splitRules.add({
-        'type': 'field',
-        'ip': ['geoip:private', 'geoip:ir'],
-        'outboundTag': 'direct',
-      });
-    } else {
-      splitRules.add({
-        'type': 'field',
-        'ip': ['geoip:private'],
-        'outboundTag': 'direct',
-      });
-    }
-
-    routingMap['rules'] = [
-      ...splitRules,
-      ...existingRules,
-    ];
-
-    // ── تزریق تنظیمات ضد فیلترینگ (Anti-DPI Overrides) ─────────────────────
-    final antiDpi = config?.antiDpiOverrides;
-    if (antiDpi != null &&
-        antiDpi.enableDynamicTweaks &&
-        antiDpi.fragmentLength.isNotEmpty) {
-      if (node['outbounds'] is List) {
-        for (final ob in node['outbounds'] as List) {
-          if (ob is Map &&
-              ob['tag'] != 'direct' &&
-              ob['tag'] != 'block' &&
-              ob['tag'] != 'dns-out') {
-            ob.putIfAbsent('streamSettings', () => <String, dynamic>{});
-            final stream = ob['streamSettings'] as Map<String, dynamic>;
-            stream.putIfAbsent('sockopt', () => <String, dynamic>{});
-            final sockopt = stream['sockopt'] as Map<String, dynamic>;
-            sockopt['fragment'] = {
-              'packets': 'tlshello',
-              'length': antiDpi.fragmentLength,
-              'interval': antiDpi.fragmentInterval.isNotEmpty
-                  ? antiDpi.fragmentInterval
-                  : '10-20',
-            };
-          }
+      if (blockAds &&
+          splitConfig != null &&
+          splitConfig.blockedDomains.isNotEmpty) {
+        final existingOutbounds =
+            List<dynamic>.from(node['outbounds'] as List? ?? []);
+        final hasBlockOutbound =
+            existingOutbounds.any((o) => o is Map && o['tag'] == 'block');
+        if (hasBlockOutbound) {
+          injectedRules.add({
+            'type': 'field',
+            'domain': splitConfig.blockedDomains,
+            'outboundTag': 'block',
+          });
         }
       }
-    }
 
-    // ── تزریق همگام‌سازی سوکت‌ها (Mux / Smux) ──────────────────────────────
-    final smux = config?.clientPreferences.smux;
-    if (smux != null && smux.enabled) {
-      if (node['outbounds'] is List) {
-        for (final ob in node['outbounds'] as List) {
-          if (ob is Map &&
-              ob['tag'] != 'direct' &&
-              ob['tag'] != 'block' &&
-              ob['tag'] != 'dns-out') {
-            ob['mux'] = {
-              'enabled': true,
-              'concurrency': smux.maxConnections > 0 ? smux.maxConnections : 8,
-            };
-          }
-        }
+      if (bypassDomestic) {
+        final domesticDomains = <String>{
+          'geosite:ir',
+          if (splitConfig != null) ...splitConfig.directDomains,
+        }.toList();
+
+        injectedRules.addAll([
+          {
+            'type': 'field',
+            'ip': ['geoip:ir'],
+            'outboundTag': 'direct',
+          },
+          {
+            'type': 'field',
+            'domain': domesticDomains,
+            'outboundTag': 'direct',
+          },
+        ]);
       }
+
+      routingMap['rules'] = [
+        ...injectedRules,
+        ...existingRules,
+      ];
     }
 
     final jsonString = jsonEncode(node);
@@ -1626,7 +1569,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
       }
 
       if (hasError) {
-        ref.read(isConnectedProvider.notifier).set(false);
+        ref.read(isConnectedProvider.notifier).state = false;
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -1636,20 +1579,14 @@ class _HomeTabState extends ConsumerState<HomeTab> {
           );
         }
       } else {
-        ref.read(isConnectedProvider.notifier).set(true);
+        ref.read(isConnectedProvider.notifier).state = true;
         if (mounted) setState(() => _isConnecting = false);
 
         if (Platform.isWindows && isVpnMode) {
           Future.microtask(() async {
             int wintunIfIdx = -1;
             for (int i = 0; i < 10; i++) {
-              if (!mounted || !ref.read(isConnectedProvider) || _abortRequested) {
-                return;
-              }
               await Future.delayed(const Duration(milliseconds: 500));
-              if (!mounted || !ref.read(isConnectedProvider) || _abortRequested) {
-                return;
-              }
               wintunIfIdx = await _wintunFFI
                   .getInterfaceIndex("CandyConnectVPN Tunnel");
               if (wintunIfIdx == -1) {
@@ -1658,9 +1595,6 @@ class _HomeTabState extends ConsumerState<HomeTab> {
               }
               if (wintunIfIdx != -1) break;
             }
-            if (!mounted || !ref.read(isConnectedProvider) || _abortRequested) {
-              return;
-            }
             if (wintunIfIdx != -1) {
               _winDivertFFI.startAntiSmhnr(wintunIfIdx);
             }
@@ -1668,7 +1602,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
         }
       }
     } catch (e) {
-      ref.read(isConnectedProvider.notifier).set(false);
+      ref.read(isConnectedProvider.notifier).state = false;
     } finally {
       if (mounted) {
         setState(() => _isConnecting = false);
@@ -1696,6 +1630,8 @@ class _HomeTabState extends ConsumerState<HomeTab> {
     final isConnected = ref.watch(isConnectedProvider);
     final isVpnMode = ref.watch(isVpnModeProvider);
     final stats = ref.watch(subscriptionStatsProvider);
+    final botHandle =
+        ref.watch(remoteConfigProvider)?.clientPreferences.telegramBotHandle;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1805,8 +1741,8 @@ class _HomeTabState extends ConsumerState<HomeTab> {
                       child: _isConnecting
                           ? Stack(
                               alignment: Alignment.center,
-                              children: [
-                                const SizedBox(
+                              children: const [
+                                SizedBox(
                                   width: 84,
                                   height: 84,
                                   child: CircularProgressIndicator(
@@ -1814,7 +1750,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
                                     strokeWidth: 3,
                                   ),
                                 ),
-                                const Icon(
+                                Icon(
                                   Icons.close_rounded,
                                   size: 36,
                                   color: Colors.white70,
@@ -2057,7 +1993,7 @@ class _HomeTabState extends ConsumerState<HomeTab> {
 
                         const SizedBox(height: 18),
 
-                        // ── Days bar (سازگار با بسته‌های ۳۰، ۶۰ و ۹۰ روزه) ──
+                          // ── Days bar (سازگار با بسته‌های ۳۰، ۶۰ و ۹۰ روزه) ──
                         _PremiumStatBar(
                           label: 'زمان باقیمانده:',
                           valueText: stats == null
@@ -2081,7 +2017,9 @@ class _HomeTabState extends ConsumerState<HomeTab> {
 
                   // ── Support Button ───────────────────────────────────────
                   TextButton.icon(
-                    onPressed: () => UrlLauncherUtils.launchTelegramSupport(),
+                    onPressed: () => UrlLauncherUtils.launchTelegramSupport(
+                      customHandle: botHandle,
+                    ),
                     icon: const Icon(Icons.support_agent_rounded,
                         color: AppTheme.neonCyan),
                     label: const Text(

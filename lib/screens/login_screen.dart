@@ -1,8 +1,8 @@
-import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:screen_capturer/screen_capturer.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -25,6 +25,7 @@ class LoginScreen extends ConsumerStatefulWidget {
 
 class _LoginScreenState extends ConsumerState<LoginScreen> {
   final TextEditingController _licenseController = TextEditingController();
+  final ImagePicker _imagePicker = ImagePicker();
 
   bool _isLoading = false;
   bool _isInvalidLicense = false;
@@ -60,12 +61,13 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       if (config == null) {
         if (mounted) {
           setState(() {
-            _errorMessage = 'خطا در دریافت تنظیمات سرور؛ لطفاً دوباره تلاش کنید.';
+            _errorMessage =
+                'خطا در دریافت تنظیمات سرور؛ لطفاً دوباره تلاش کنید.';
           });
         }
         return;
       }
-      ref.read(remoteConfigProvider.notifier).set(config);
+      ref.read(remoteConfigProvider.notifier).state = config;
 
       final subService = SubscriptionService(
         config.apiEndpoints.baseJsonSubUrl,
@@ -78,37 +80,17 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
             : const [],
       );
 
-      List<dynamic>? subscription =
-          await subService.fetchSubscription(license);
-
-      // پشتیبانی اضطراری در صورت فیلتر بودن تمام دامنه‌های اشتراک
-      if (subscription == null &&
-          config.emergencyAccess.enableHardcodedFallback &&
-          config.emergencyAccess.fallbackNodes.isNotEmpty) {
-        final fallbackList = <dynamic>[];
-        for (final raw in config.emergencyAccess.fallbackNodes) {
-          try {
-            final parsed = jsonDecode(raw);
-            if (parsed is Map) fallbackList.add(parsed);
-          } catch (_) {
-            fallbackList.add({'address': raw, 'port': 443});
-          }
-        }
-        if (fallbackList.isNotEmpty) {
-          subscription = fallbackList;
-        }
-      }
-
+      final subscription = await subService.fetchSubscription(license);
       if (subscription != null) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('license_key', license);
 
         // پاکسازی استیت‌های قبلی و مقداردهی اکانت جدید
-        ref.read(subscriptionStatsProvider.notifier).set(null);
-        ref.read(isPromoDismissedProvider.notifier).set(false);
-        ref.read(currentLicenseProvider.notifier).set(license);
-        ref.read(subscriptionJsonProvider.notifier).set(subscription);
-        ref.read(navIndexProvider.notifier).set(0);
+        ref.read(subscriptionStatsProvider.notifier).state = null;
+        ref.read(isPromoDismissedProvider.notifier).state = false;
+        ref.read(currentLicenseProvider.notifier).state = license;
+        ref.read(subscriptionJsonProvider.notifier).state = subscription;
+        ref.read(navIndexProvider.notifier).state = 0;
 
         if (!mounted) return;
         Navigator.pushAndRemoveUntil(
@@ -133,7 +115,8 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     } catch (e) {
       if (mounted) {
         setState(() {
-          _errorMessage = 'خطا در برقراری ارتباط با سرور؛ لطفاً دوباره تلاش کنید!';
+          _errorMessage =
+              'خطا در برقراری ارتباط با سرور؛ لطفاً دوباره تلاش کنید!';
         });
       }
     } finally {
@@ -159,7 +142,48 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     }
   }
 
-  /// اسکن بارکد (در دسکتاپ از روی صفحه نمایش، در موبایل با دوربین)
+  /// انتخاب مستقیم تصویر بارکد از گالری (در صفحه لاگین)
+  Future<void> _handleGalleryQRPick() async {
+    try {
+      HapticFeedback.lightImpact();
+      final XFile? pickedFile = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+      );
+      if (pickedFile == null || !mounted) return;
+
+      setState(() {
+        _isLoading = true;
+        _errorMessage = null;
+      });
+
+      final bytes = await File(pickedFile.path).readAsBytes();
+      final decodedText = await decodeQrFromBytesIsolate(bytes);
+
+      if (!mounted) return;
+
+      if (decodedText != null && decodedText.isNotEmpty) {
+        setState(() {
+          _licenseController.text = decodedText;
+          _isLoading = false;
+        });
+        await _login();
+      } else {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = 'هیچ بارکد معتبری در تصویر انتخابی یافت نشد.';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = 'خطا در بارگذاری تصویر از گالری.';
+        });
+      }
+    }
+  }
+
+  /// اسکن بارکد (در دسکتاپ از روی صفحه نمایش، در موبایل با دوربین + گالری)
   Future<void> _handleQRScan() async {
     HapticFeedback.lightImpact();
     if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
@@ -219,7 +243,9 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
 
   void _openTelegramSupport() {
     HapticFeedback.lightImpact();
-    UrlLauncherUtils.launchTelegramSupport();
+    final botHandle =
+        ref.read(remoteConfigProvider)?.clientPreferences.telegramBotHandle;
+    UrlLauncherUtils.launchTelegramSupport(customHandle: botHandle);
   }
 
   @override
@@ -238,8 +264,12 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 440),
                   child: GlassCard(
-                    height: 500,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 24.0,
+                      vertical: 36.0,
+                    ),
                     child: Column(
+                      mainAxisSize: MainAxisSize.min,
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Text(
@@ -276,7 +306,8 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 12, vertical: 8),
                               decoration: BoxDecoration(
-                                color: AppTheme.errorRed.withValues(alpha: 0.12),
+                                color:
+                                    AppTheme.errorRed.withValues(alpha: 0.12),
                                 borderRadius: BorderRadius.circular(10),
                                 border: Border.all(
                                   color:
@@ -331,6 +362,18 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                                     onPressed:
                                         _isLoading ? null : _pasteFromClipboard,
                                   ),
+                                  if (isMobile)
+                                    IconButton(
+                                      tooltip: 'انتخاب بارکد از گالری',
+                                      icon: const Icon(
+                                        Icons.photo_library_outlined,
+                                        color: AppTheme.neonCyan,
+                                        size: 21,
+                                      ),
+                                      onPressed: _isLoading
+                                          ? null
+                                          : _handleGalleryQRPick,
+                                    ),
                                   IconButton(
                                     tooltip: isMobile
                                         ? 'اسکن بارکد با دوربین'

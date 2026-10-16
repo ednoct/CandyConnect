@@ -112,10 +112,10 @@ class SubscriptionStats {
     // بررسی فلگ صریح وضعیت در صورت ارسال از سمت سرور
     final String statusFlag =
         (data['status'] ?? '').toString().trim().toLowerCase();
-    final bool explicitlyDisabled =
+    final bool ExplicitlyDisabled =
         data['enable'] == false || statusFlag == 'expired' || statusFlag == 'disabled';
 
-    if (explicitlyDisabled || (!isUnlimitedTraffic && remainingGB <= 0)) {
+    if (ExplicitlyDisabled || (!isUnlimitedTraffic && remainingGB <= 0)) {
       isExpired = true;
     }
 

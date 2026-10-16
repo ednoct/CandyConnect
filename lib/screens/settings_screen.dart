@@ -8,8 +8,8 @@ import 'package:device_apps/device_apps.dart';
 import '../providers/app_providers.dart';
 import '../widgets/glass_card.dart';
 import '../theme/app_theme.dart';
+import '../core/xray_bridge.dart';
 import '../core/desktop_manager.dart';
-import 'home_screen.dart';
 import 'login_screen.dart';
 
 class SettingsTab extends ConsumerWidget {
@@ -202,21 +202,32 @@ class SettingsTab extends ConsumerWidget {
 
     if (DesktopManager().isDesktop) {
       await DesktopManager().applySystemProxy(enable: false);
+      await DesktopManager().updateTrayIcon(false);
     }
 
     final isConnected = ref.read(isConnectedProvider);
     if (isConnected) {
-      // توقف قطعی و ایمن تمام لایه‌های تونل، درایورهای کرنل (Wintun/WinDivert)، پروکسی سیستم و هسته
-      await safeStopAllTunnels();
-      ref.read(isConnectedProvider.notifier).set(false);
+      if (DesktopManager().onBeforeExitCleanup != null) {
+        await DesktopManager().onBeforeExitCleanup!();
+      } else {
+        if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+          const vpnChannel = MethodChannel('candyconnect/vpn');
+          try {
+            await vpnChannel.invokeMethod('stopVpn');
+          } catch (_) {}
+        }
+        try {
+          await XrayBridge.stopXray();
+        } catch (e) {
+          debugPrint('Error stopping Xray during logout: $e');
+        }
+      }
+      ref.read(isConnectedProvider.notifier).state = false;
     }
 
-    // ── Bug Fix: پاکسازی سراسری تمام استیت‌های وابسته ──────────────────────────
-    ref.read(currentLicenseProvider.notifier).set(null);
-    ref.read(subscriptionJsonProvider.notifier).set(null);
-    ref.read(subscriptionStatsProvider.notifier).set(null);
-    ref.read(navIndexProvider.notifier).set(0);
-    ref.read(isPromoDismissedProvider.notifier).set(false);
+    ref.read(currentLicenseProvider.notifier).state = null;
+    ref.read(subscriptionJsonProvider.notifier).state = null;
+    ref.read(subscriptionStatsProvider.notifier).state = null;
 
     if (context.mounted) {
       Navigator.pushAndRemoveUntil(
@@ -286,7 +297,6 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
           final ip = addr.address;
           if (ip.startsWith('127.') || ip.startsWith('169.254.')) continue;
 
-          // اولویت اول با رنج استاندارد مودم‌ها و روترهای خانگی
           if (ip.startsWith('192.168.')) {
             if (mounted) {
               setState(() {
@@ -342,7 +352,7 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
   Widget build(BuildContext context) {
     final isLanSharing = ref.watch(isLanSharingProvider);
     final isVpnMode = ref.watch(isVpnModeProvider);
-    final isSystemProxy = ref.watch(isSystemProxyProvider);
+    final systemProxyDesktop = ref.watch(desktopSystemProxyProvider);
 
     return GlassCard(
       height: MediaQuery.of(context).size.height * 0.72,
@@ -388,7 +398,6 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
           ),
           const Divider(color: Colors.white12, height: 16),
 
-          // ── Scrollable Body (جلوگیری از RenderFlex Overflow) ─────────────
           Expanded(
             child: SingleChildScrollView(
               physics: const BouncingScrollPhysics(),
@@ -421,7 +430,7 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
                     activeThumbColor: AppTheme.neonCyan,
                     onChanged: (val) {
                       HapticFeedback.selectionClick();
-                      ref.read(isLanSharingProvider.notifier).set(val);
+                      ref.read(isLanSharingProvider.notifier).state = val;
                       _notifyReconnectIfActive();
                     },
                   ),
@@ -444,13 +453,14 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
                         'تنظیم خودکار پروکسی مرورگرها و سیستم‌عامل',
                         style: TextStyle(color: Colors.white54, fontSize: 12),
                       ),
-                      value: isSystemProxy,
+                      value: systemProxyDesktop,
                       activeThumbColor: AppTheme.neonCyan,
                       onChanged: (val) async {
                         HapticFeedback.selectionClick();
-                        ref.read(isSystemProxyProvider.notifier).set(val);
+                        ref.read(desktopSystemProxyProvider.notifier).state =
+                            val;
                         if (val) {
-                          ref.read(isVpnModeProvider.notifier).set(false);
+                          ref.read(isVpnModeProvider.notifier).state = false;
                         }
                         final isConnected = ref.read(isConnectedProvider);
                         await DesktopManager().applySystemProxy(
@@ -484,17 +494,18 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
                     activeThumbColor: AppTheme.neonCyan,
                     onChanged: (val) async {
                       HapticFeedback.selectionClick();
-                      ref.read(isVpnModeProvider.notifier).set(val);
+                      ref.read(isVpnModeProvider.notifier).state = val;
                       if (widget.isDesktop) {
                         if (val) {
-                          ref.read(isSystemProxyProvider.notifier).set(false);
+                          ref.read(desktopSystemProxyProvider.notifier).state =
+                              false;
                           await DesktopManager().applySystemProxy(enable: false);
                         }
                         await DesktopManager().updateTrayIcon(
                           ref.read(isConnectedProvider),
                           mode: val
                               ? DesktopRoutingMode.tunnelVpn
-                              : (ref.read(isSystemProxyProvider)
+                              : (ref.read(desktopSystemProxyProvider)
                                   ? DesktopRoutingMode.proxySystem
                                   : DesktopRoutingMode.proxyLocal),
                         );
@@ -514,7 +525,7 @@ class _ProxySettingsModalState extends ConsumerState<_ProxySettingsModal> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Copyable TextField (بدون نشت حافظه کنترلر)
+//  Copyable TextField
 // ════════════════════════════════════════════════════════════════════════════
 
 class _CopyableTextField extends StatefulWidget {
@@ -626,7 +637,7 @@ class _CopyableTextFieldState extends State<_CopyableTextField> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Per-App Proxy Modal (با قابلیت جستجو، سنجاق منتخبان و کش آیکون)
+//  Per-App Proxy Modal
 // ════════════════════════════════════════════════════════════════════════════
 
 class PerAppProxyModal extends ConsumerStatefulWidget {
@@ -640,7 +651,7 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
   static const List<String> _modeLabels = [
     'پروکسی کردن تمام برنامه‌ها',
     'فقط برنامه‌های انتخاب‌شده',
-    'استثنا کردن برنامه‌های انتخاب‌شده ',
+    'استثنا کردن برنامه‌های انتخاب‌شده',
   ];
 
   final TextEditingController _searchController = TextEditingController();
@@ -669,7 +680,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
         includeSystemApps: showSystem,
         onlyAppsWithLaunchIntent: !showSystem,
       ).then((apps) {
-        // مرتب‌سازی هوشمند: ابتدا برنامه‌های تیک‌خورده، سپس بر اساس حروف الفبا
         apps.sort((a, b) {
           final aSel = currentlySelected.contains(a.packageName);
           final bSel = currentlySelected.contains(b.packageName);
@@ -696,7 +706,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
       borderRadius: 30,
       child: Column(
         children: [
-          // ── Drag handle ─────────────────────────────────────────────────
           Center(
             child: Container(
               width: 40,
@@ -709,7 +718,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
             ),
           ),
 
-          // ── Header: title & selected badge ──────────────────────────────
           Padding(
             padding: const EdgeInsets.only(bottom: 12),
             child: Row(
@@ -747,7 +755,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
             ),
           ),
 
-          // ── Controls row: Mode dropdown + System-apps toggle ────────────
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 4),
             child: Row(
@@ -759,7 +766,7 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
                     labels: _modeLabels,
                     onChanged: (val) {
                       HapticFeedback.selectionClick();
-                      ref.read(perAppProxyModeProvider.notifier).set(val);
+                      ref.read(perAppProxyModeProvider.notifier).state = val;
                     },
                   ),
                 ),
@@ -767,8 +774,8 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
                 TextButton.icon(
                   onPressed: () {
                     HapticFeedback.lightImpact();
-                    ref.read(showSystemAppsProvider.notifier).set(
-                        !showSystem);
+                    ref.read(showSystemAppsProvider.notifier).state =
+                        !showSystem;
                     _loadApps();
                   },
                   icon: Icon(
@@ -789,7 +796,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
             ),
           ),
 
-          // ── Search Bar ──────────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
             child: TextField(
@@ -832,7 +838,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
 
           const Divider(color: Colors.white12, height: 1),
 
-          // ── App list ────────────────────────────────────────────────────
           Expanded(
             child: AnimatedOpacity(
               duration: const Duration(milliseconds: 200),
@@ -914,8 +919,6 @@ class _PerAppProxyModalState extends ConsumerState<PerAppProxyModal> {
   }
 }
 
-// ── Mode Dropdown ─────────────────────────────────────────────────────────────
-
 class _ModeDropdown extends StatelessWidget {
   final int value;
   final List<String> labels;
@@ -972,8 +975,6 @@ class _ModeDropdown extends StatelessWidget {
     );
   }
 }
-
-// ── App List Tile (بهینه‌سازی شده با cacheWidth برای رندر سریع آیکون) ───────────
 
 class _AppListTile extends StatelessWidget {
   final Application app;

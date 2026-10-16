@@ -8,11 +8,21 @@ class RemoteConfigService {
   static const String _configUrl =
       'https://api.github.com/repos/ednoct/private/contents/config.json?ref=main';
 
-  // حفظ مقدار پیش‌فرض CANDY_PAT به همراه پشتیبانی از تزریق امن در زمان بیلد (--dart-define=REMOTE_CONFIG_PAT=...)
-  static const String _githubToken = String.fromEnvironment(
-    'REMOTE_CONFIG_PAT',
-    defaultValue: 'CANDY_PAT',
-  );
+  // پشتیبانی همزمان از تزریق با sed و هر دو پرچم --dart-define در release.yml
+  static const String _defaultToken = 'CANDY_PAT';
+  static const String _envCandyPat = String.fromEnvironment('CANDY_PAT');
+  static const String _envRemotePat =
+      String.fromEnvironment('REMOTE_CONFIG_PAT');
+
+  static String get _githubToken {
+    if (_envCandyPat.isNotEmpty && _envCandyPat != 'CANDY_PAT') {
+      return _envCandyPat;
+    }
+    if (_envRemotePat.isNotEmpty && _envRemotePat != 'CANDY_PAT') {
+      return _envRemotePat;
+    }
+    return _defaultToken;
+  }
 
   static const String _cacheKey = 'cached_remote_config_json';
 

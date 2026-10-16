@@ -58,11 +58,26 @@ jobs:
           CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
           if (Test-Path "lib/services/remote_config_service.dart") {
-            (Get-Content "lib/services/remote_config_service.dart") -replace "= 'CANDY_PAT';", "= '$env:CANDY_PAT';" | Set-Content "lib/services/remote_config_service.dart" -Encoding UTF8
+            (Get-Content "lib/services/remote_config_service.dart") -replace "'CANDY_PAT'", "'$env:CANDY_PAT'" | Set-Content "lib/services/remote_config_service.dart" -Encoding UTF8
           }
           flutter config --enable-windows-desktop
           flutter pub get
-          flutter build windows --release --dart-define=CANDY_PAT="$env:CANDY_PAT"
+          flutter build windows --release --dart-define=CANDY_PAT="$env:CANDY_PAT" --dart-define=REMOTE_CONFIG_PAT="$env:CANDY_PAT"
+
+      - name: Stage Native Windows Binaries (DLLs, Drivers & Watchdog)
+        shell: pwsh
+        run: |
+          $ReleaseDir = "build\windows\x64\runner\Release"
+          $RequiredBinaries = @("libXray.dll", "wintun.dll", "WinDivert.dll", "WinDivert64.sys", "candy_watchdog.exe")
+          foreach ($bin in $RequiredBinaries) {
+            if (-not (Test-Path "$ReleaseDir\$bin")) {
+              $found = Get-ChildItem -Path . -Filter $bin -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*\build\*" } | Select-Object -First 1
+              if ($found) {
+                Copy-Item -Path $found.FullName -Destination "$ReleaseDir\$bin" -Force
+                Write-Host "Copied $($found.FullName) to $ReleaseDir\$bin"
+              }
+            }
+          }
 
       - name: Create Inno Setup Script & Build Installer
         shell: pwsh
@@ -79,6 +94,8 @@ jobs:
           DefaultGroupName=$env:APP_NAME
           UninstallDisplayIcon={app}\$AppExe
           SetupIconFile=windows\runner\resources\app_icon.ico
+          PrivilegesRequired=admin
+          CloseApplications=force
           Compression=lzma2/ultra64
           SolidCompression=yes
           OutputDir=dist
@@ -98,7 +115,7 @@ jobs:
           Name: "{autodesktop}\$env:APP_NAME"; Filename: "{app}\$AppExe"; Tasks: desktopicon
 
           [Run]
-          Filename: "{app}\$AppExe"; Description: "{cm:LaunchProgram,$env:APP_NAME}"; Flags: nowait postinstall skipifsilent
+          Filename: "{app}\$AppExe"; Description: "{cm:LaunchProgram,$env:APP_NAME}"; Flags: nowait postinstall skipifsilent shellexec
           "@
 
           New-Item -ItemType Directory -Force -Path dist
@@ -158,11 +175,23 @@ jobs:
           CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
           if [ -f "lib/services/remote_config_service.dart" ]; then
-            sed -i "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+            sed -i "s|'CANDY_PAT'|'${CANDY_PAT}'|g" lib/services/remote_config_service.dart
           fi
           flutter config --enable-linux-desktop
           flutter pub get
-          flutter build linux --release --dart-define=CANDY_PAT="${CANDY_PAT}"
+          flutter build linux --release --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
+
+      - name: Stage libXray.so in Linux Bundle
+        run: |
+          BUNDLE_DIR="build/linux/x64/release/bundle"
+          mkdir -p "${BUNDLE_DIR}/lib"
+          if [ ! -f "${BUNDLE_DIR}/lib/libXray.so" ] && [ ! -f "${BUNDLE_DIR}/libXray.so" ]; then
+            FOUND_SO=$(find . -name "libXray.so" -not -path "./build/*" | head -n 1)
+            if [ -n "$FOUND_SO" ]; then
+              cp -f "$FOUND_SO" "${BUNDLE_DIR}/lib/libXray.so"
+              cp -f "$FOUND_SO" "${BUNDLE_DIR}/libXray.so"
+            fi
+          fi
 
       - name: Package Debian / Ubuntu (.deb) Installer
         run: |
@@ -191,7 +220,7 @@ jobs:
           cp "$ICON_256" "${PKG_DIR}/usr/share/pixmaps/candyconnect.png"
           cp "$ICON_256" "${PKG_DIR}/usr/share/icons/hicolor/256x256/apps/candyconnect.png"
           cp "$ICON_512" "${PKG_DIR}/usr/share/icons/hicolor/512x512/apps/candyconnect.png"
-          cp "$ICON_256" "${PKG_DIR}/opt/${APP_NAME}/icon.png" 
+          cp "$ICON_256" "${PKG_DIR}/opt/${APP_NAME}/icon.png"
 
           cat <<EOF > "${PKG_DIR}/usr/share/applications/candyconnect.desktop"
           [Desktop Entry]
@@ -243,6 +272,7 @@ jobs:
           Architecture: amd64
           Maintainer: CandyConnect <info@candyconnect.online>
           Depends: libgtk-3-0, libayatana-appindicator3-1 | libappindicator3-1, libkeybinder-3.0-0, libsecret-1-0
+          Recommends: gnome-screenshot | scrot
           Description: CandyConnect Proxy Client
            Cross-platform secure VPN and tunneling application.
           EOF
@@ -260,7 +290,7 @@ jobs:
 
           ICON_FILE="assets/icons/app_icon_256.png"
           if [ ! -f "$ICON_FILE" ]; then ICON_FILE="assets/icon.png"; fi
-          cp "$ICON_FILE" "${TAR_DIR}/icon.png" 
+          cp "$ICON_FILE" "${TAR_DIR}/icon.png"
 
           cat <<EOF > "${TAR_DIR}/install.sh"
           #!/bin/bash
@@ -358,7 +388,6 @@ jobs:
                           content = file.read()
                       orig = content
                       content = content.replace('jcenter()', 'mavenCentral()')
-                      # Upgrade any hardcoded old compileSdkVersion (e.g., 28, 29, 30, 31, 32, 33, 34) to 35
                       content = re.sub(r'compileSdkVersion\s*=?\s*(2[0-9]|3[0-4])\b', 'compileSdkVersion 35', content)
                       content = re.sub(r'compileSdk\s*=?\s*(2[0-9]|3[0-4])\b', 'compileSdk = 35', content)
                       if content != orig:
@@ -420,10 +449,10 @@ jobs:
           CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
           if [ -f "lib/services/remote_config_service.dart" ]; then
-            sed -i "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+            sed -i "s|'CANDY_PAT'|'${CANDY_PAT}'|g" lib/services/remote_config_service.dart
           fi
-          flutter build apk --release --split-per-abi --android-skip-build-dependency-validation --dart-define=CANDY_PAT="${CANDY_PAT}"
-          flutter build apk --release --android-skip-build-dependency-validation --dart-define=CANDY_PAT="${CANDY_PAT}"
+          flutter build apk --release --split-per-abi --android-skip-build-dependency-validation --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
+          flutter build apk --release --android-skip-build-dependency-validation --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
 
       - name: Prepare Android Artifacts
         run: |
@@ -471,11 +500,11 @@ jobs:
           CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
           if [ -f "lib/services/remote_config_service.dart" ]; then
-            sed -i '' "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+            sed -i '' "s|'CANDY_PAT'|'${CANDY_PAT}'|g" lib/services/remote_config_service.dart
           fi
           flutter config --enable-macos-desktop
           flutter pub get
-          flutter build macos --release --dart-define=CANDY_PAT="${CANDY_PAT}"
+          flutter build macos --release --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
 
       - name: Create macOS DMG
         run: |
@@ -522,10 +551,10 @@ jobs:
           CANDY_PAT: ${{ secrets.CANDY_PAT }}
         run: |
           if [ -f "lib/services/remote_config_service.dart" ]; then
-            sed -i '' "s|= 'CANDY_PAT';|= '${CANDY_PAT}';|g" lib/services/remote_config_service.dart
+            sed -i '' "s|'CANDY_PAT'|'${CANDY_PAT}'|g" lib/services/remote_config_service.dart
           fi
           flutter pub get
-          flutter build ios --release --no-codesign --dart-define=CANDY_PAT="${CANDY_PAT}"
+          flutter build ios --release --no-codesign --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
 
       - name: Package Unsigned IPA
         run: |

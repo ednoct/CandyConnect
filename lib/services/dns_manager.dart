@@ -22,8 +22,8 @@ class DnsManager {
   static const String _fallbackBootstrap = '5.200.200.200';
   static const String _fallbackRemote = '8.8.8.8';
 
-  /// استخراج آدرس IP تمیز (حذف پورت یا اسکیما در صورت وجود در کانفیگ)
-  static String _cleanDnsHost(String raw) {
+  /// استخراج آدرس IP/Host تمیز برای تست سوکت TCP پورت ۵۳ روی سرورهای Bootstrap
+  static String _cleanBootstrapHost(String raw) {
     String s = raw.trim();
     if (s.contains('://')) {
       final uri = Uri.tryParse(s);
@@ -35,11 +35,37 @@ class DnsManager {
     return s;
   }
 
+  /// نرمال‌سازی سرورهای Remote DNS با حفظ کامل آدرس‌های DoH (مانند https://cloudflare-dns.com/dns-query)
+  static String _cleanRemoteDnsEntry(String raw) {
+    final String s = raw.trim();
+    if (s.isEmpty) return '';
+    if (s.startsWith('https://') ||
+        s.startsWith('http://') ||
+        s.startsWith('https+local://') ||
+        s.startsWith('quic+local://') ||
+        s.startsWith('tcp://') ||
+        s.startsWith('tcp+local://')) {
+      return s;
+    }
+    return _cleanBootstrapHost(s);
+  }
+
+  /// بررسی اینکه آیا رشته DNS یک آدرس IPv4 خالص است (مورد نیاز برای تنظیمات آداپتور TUN ویندوز)
+  static bool isIpv4Address(String dns) {
+    final parts = dns.trim().split('.');
+    if (parts.length != 4) return false;
+    for (final p in parts) {
+      final n = int.tryParse(p);
+      if (n == null || n < 0 || n > 255) return false;
+    }
+    return true;
+  }
+
   // ── Phase 1: Bootstrap DNS Race ───────────────────────────────────────────
 
   Future<String> raceBestBootstrap(List<String> pool) async {
     final cleanedPool = pool
-        .map(_cleanDnsHost)
+        .map(_cleanBootstrapHost)
         .where((ip) => ip.isNotEmpty)
         .toSet()
         .toList();
@@ -109,8 +135,8 @@ class DnsManager {
     required List<String> remoteDnsPool,
   }) {
     final cleanedDnsPool = remoteDnsPool
-        .map(_cleanDnsHost)
-        .where((ip) => ip.isNotEmpty)
+        .map(_cleanRemoteDnsEntry)
+        .where((entry) => entry.isNotEmpty)
         .toSet()
         .toList();
 

@@ -53,11 +53,9 @@ void _benchmarkIsolateEntry(List<dynamic> args) {
 
 class ConnectionOptimizer {
   static const int _benchBasePort = 12100;
-  static int _runCounter = 0;
   static const Duration _xrayWarmup = Duration(milliseconds: 1200);
   static const int _probeTimeoutMs = 5500;
 
-  final Set<HttpClient> _activeClients = {};
   Isolate? _benchmarkIsolate;
   ReceivePort? _benchmarkPort;
   File? _configFile;
@@ -79,12 +77,9 @@ class ConnectionOptimizer {
       '${limited.length} variants, probe: $probeUrl',
     );
 
-    // پورت پایه متغیر برای جلوگیری از تداخل پورت با پروسه‌های قبلی یا TIME_WAIT
-    final basePort = _benchBasePort + ((_runCounter++ % 10) * 10);
-
     // ── Step 1: Build the multi-outbound benchmark Xray config ───────────
     final buildResult =
-        _buildBenchmarkConfig(limited, bootstrapDns, basePort);
+        _buildBenchmarkConfig(limited, bootstrapDns, _benchBasePort);
     if (buildResult == null || buildResult.boundVariants.isEmpty) {
       debugPrint('[ConnectionOptimizer] No parseable proxy outbounds found — '
           'skipping real-delay phase.');
@@ -147,50 +142,13 @@ class ConnectionOptimizer {
     return winner;
   }
 
-  /// لغو فوری بنچمارک در حال اجرا و آزادسازی تمام منابع
   Future<void> cancel() async {
     if (_cancelled) return;
     _cancelled = true;
     debugPrint('[ConnectionOptimizer] cancel() invoked.');
-    for (final c in _activeClients) {
-      try {
-        c.close(force: true);
-      } catch (_) {}
-    }
-    _activeClients.clear();
     await _stopBenchmarkCore();
     _cleanup();
   }
-
-  /// نسخه همزمان (Sync) برای فراخوانی از dispose — بدون انتظار برای توقف ایزوله
-  void cancelSync() {
-    if (_cancelled) return;
-    _cancelled = true;
-    for (final c in _activeClients) {
-      try {
-        c.close(force: true);
-      } catch (_) {}
-    }
-    _activeClients.clear();
-    _benchmarkIsolate?.kill(priority: Isolate.immediate);
-    _benchmarkIsolate = null;
-    _benchmarkPort?.close();
-    _benchmarkPort = null;
-    try {
-      XrayBridge.invoke(jsonEncode({
-        'apiVersion': 1,
-        'method': 'stopXray',
-        'payload': {},
-      }));
-    } catch (_) {}
-    try {
-      if (_configFile != null && _configFile!.existsSync()) {
-        _configFile!.deleteSync();
-      }
-    } catch (_) {}
-    _configFile = null;
-  }
-
 
   // ── Private: Config Building ──────────────────────────────────────────────
 
@@ -356,7 +314,6 @@ class ConnectionOptimizer {
     HttpClient? client;
     try {
       client = HttpClient();
-      _activeClients.add(client);
       client.connectionTimeout =
           const Duration(milliseconds: _probeTimeoutMs);
       client.idleTimeout = const Duration(seconds: 2);
@@ -400,9 +357,6 @@ class ConnectionOptimizer {
       sw.stop();
       return null;
     } finally {
-      if (client != null) {
-        _activeClients.remove(client);
-      }
       try {
         client?.close(force: true);
       } catch (_) {}

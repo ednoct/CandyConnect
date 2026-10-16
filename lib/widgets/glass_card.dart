@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 class GlassCard extends StatelessWidget {
   final Widget child;
   final double width;
-  final double height;
+  final double? height;
   final double borderRadius;
   final EdgeInsetsGeometry padding;
   final Color? borderColor;
@@ -14,7 +14,7 @@ class GlassCard extends StatelessWidget {
     super.key,
     required this.child,
     this.width = double.infinity,
-    this.height = double.infinity,
+    this.height,
     this.borderRadius = 20.0,
     this.padding = const EdgeInsets.all(16.0),
     this.borderColor,
@@ -50,7 +50,6 @@ class GlassCard extends StatelessWidget {
             padding: padding,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(borderRadius),
-              // درخشش قطری ملایم (Specular Sheen) مشابه شیشه‌های فضایی VisionOS
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,

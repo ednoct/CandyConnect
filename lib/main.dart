@@ -32,14 +32,6 @@ Future<bool> _acquireSingleInstanceLock({required bool isElevationRelaunch}) asy
     } catch (_) {}
   };
 
-  // ثبت کالبک آزادسازی سوکت در خروج اجباری DesktopManager
-  DesktopManager.onBeforeSingleInstanceExit = () async {
-    try {
-      await _singleInstanceSocket?.close();
-      _singleInstanceSocket = null;
-    } catch (_) {}
-  };
-
   final int maxAttempts = isElevationRelaunch ? 8 : 1;
 
   for (int attempt = 0; attempt < maxAttempts; attempt++) {
@@ -49,22 +41,18 @@ Future<bool> _acquireSingleInstanceLock({required bool isElevationRelaunch}) asy
         _kSingleInstancePort,
       );
 
-      _singleInstanceSocket!.listen(
-        (Socket client) async {
-          client.listen(
-            (_) {},
-            onError: (_) {},
-            onDone: () async {
-              if (await windowManager.isMinimized()) {
-                await windowManager.restore();
-              }
-              await windowManager.show();
-              await windowManager.focus();
-            },
-          );
-        },
-        onError: (_) {},
-      );
+      _singleInstanceSocket!.listen((Socket client) async {
+        client.listen(
+          (_) {},
+          onDone: () async {
+            if (await windowManager.isMinimized()) {
+              await windowManager.restore();
+            }
+            await windowManager.show();
+            await windowManager.focus();
+          },
+        );
+      });
       return true;
     } on SocketException {
       if (isElevationRelaunch && attempt < maxAttempts - 1) {
@@ -113,7 +101,7 @@ void main(List<String> args) async {
   final savedLicense = prefs.getString('license_key');
 
   if (savedLicense != null && savedLicense.isNotEmpty) {
-    container.read(currentLicenseProvider.notifier).set(savedLicense);
+    container.read(currentLicenseProvider.notifier).state = savedLicense;
   }
 
   runApp(

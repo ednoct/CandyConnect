@@ -1,38 +1,10 @@
-import 'dart:ffi' hide Size;
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'xray_bridge.dart';
 import '../windows/watchdog_manager.dart';
-
-typedef _InternetSetOptionWNative = Int32 Function(
-  Pointer<Void> hInternet,
-  Uint32 dwOption,
-  Pointer<Void> lpBuffer,
-  Uint32 dwBufferLength,
-);
-typedef _InternetSetOptionWDart = int Function(
-  Pointer<Void> hInternet,
-  int dwOption,
-  Pointer<Void> lpBuffer,
-  int dwBufferLength,
-);
-
-void _notifyWininetProxyChange() {
-  if (!Platform.isWindows) return;
-  try {
-    final wininet = DynamicLibrary.open('wininet.dll');
-    final setOption = wininet.lookupFunction<_InternetSetOptionWNative, _InternetSetOptionWDart>('InternetSetOptionW');
-    // INTERNET_OPTION_SETTINGS_CHANGED = 39
-    setOption(nullptr, 39, nullptr, 0);
-    // INTERNET_OPTION_REFRESH = 37
-    setOption(nullptr, 37, nullptr, 0);
-  } catch (e) {
-    debugPrint('[DesktopManager] Failed to notify wininet: $e');
-  }
-}
+import 'xray_bridge.dart';
 
 /// مدل حالت‌های شبکه در دسکتاپ
 enum DesktopRoutingMode {
@@ -52,11 +24,10 @@ class DesktopManager with WindowListener, TrayListener {
   bool _isConnected = false;
   DesktopRoutingMode _currentMode = DesktopRoutingMode.tunnelVpn;
 
-  /// کالبک‌های اختیاری برای اتصال مستقیم منوی Tray به وضعیت Riverpod در MainScreen / HomeTab
+  /// کالبک‌های ارتباطی برای اتصال مستقیم منوی Tray به وضعیت Riverpod در MainScreen / HomeTab
   VoidCallback? onToggleConnectionRequested;
   void Function(DesktopRoutingMode mode)? onModeChanged;
   Future<void> Function()? onBeforeExitCleanup;
-  static Future<void> Function()? onBeforeSingleInstanceExit;
 
   Future<void> init() async {
     if (!isDesktop) return;
@@ -246,7 +217,6 @@ class DesktopManager with WindowListener, TrayListener {
             '/f',
           ]);
         }
-        _notifyWininetProxyChange();
       } else if (Platform.isLinux) {
         if (enable) {
           await Process.run(
@@ -270,13 +240,13 @@ class DesktopManager with WindowListener, TrayListener {
       } else if (Platform.isMacOS) {
         for (final service in ['Wi-Fi', 'Ethernet']) {
           if (enable) {
-            await Process.run(
-                'networksetup', ['-setsocksfirewallproxy', service, host, '$port']);
+            await Process.run('networksetup',
+                ['-setsocksfirewallproxy', service, host, '$port']);
             await Process.run(
                 'networksetup', ['-setsocksfirewallproxystate', service, 'on']);
           } else {
-            await Process.run(
-                'networksetup', ['-setsocksfirewallproxystate', service, 'off']);
+            await Process.run('networksetup',
+                ['-setsocksfirewallproxystate', service, 'off']);
           }
         }
       }
@@ -360,37 +330,32 @@ class DesktopManager with WindowListener, TrayListener {
     }
   }
 
-  /// خروج ایمن و کامل بدون باقی گذاشتن پروکسی سیستم یا کارت شبکه مجازی باز
+  /// خروج ایمن و کامل بدون باقی گذاشتن پروکسی سیستم، کارت شبکه مجازی یا واچ‌داگ فعال
   Future<void> hardExit() async {
     try {
-      // ۱. مخفی‌سازی آنی پنجره برای حس سرعت بالا در سمت کاربر
+      // ۱. اعلام خروج مجاز به واچ‌داگ ویندوز پیش از بستن منابع
+      if (Platform.isWindows) {
+        WatchdogManager().signalCleanExit();
+      }
+
+      // ۲. مخفی‌سازی آنی پنجره برای حس سرعت بالا در سمت کاربر
       await windowManager.hide();
 
-      // ۲. خاموش کردن پروکسی سیستم‌عامل تا اینترنت مرورگر کاربر قطع نماند
+      // ۳. خاموش کردن پروکسی سیستم‌عامل تا اینترنت مرورگر کاربر قطع نماند
       await applySystemProxy(enable: false);
 
-      // ۳. اجرای کالبک پاکسازی درایورهای Wintun/WinDivert در صورت ثبت شدن
+      // ۴. اجرای کالبک پاکسازی درایورهای Wintun/WinDivert در صورت ثبت شدن
       if (onBeforeExitCleanup != null) {
         await onBeforeExitCleanup!();
       }
 
-      // ۴. توقف کامل ایزوله Xray و حذف فایل‌های کانفیگ موقت
+      // ۵. توقف کامل ایزوله Xray و حذف فایل‌های کانفیگ موقت
       await XrayBridge.stopXray();
 
-      // ۵. آزادسازی سوکت تک‌نمونه‌ای
-      if (onBeforeSingleInstanceExit != null) {
-        try {
-          await onBeforeSingleInstanceExit!();
-        } catch (_) {}
-      }
-
-      // ۶. اعلام خروج پاک به واچ‌داگ و خاتمه آن جهت جلوگیری از فعال شدن روتین نجات کرش
+      // ۶. خاتمه دادن به پروسه واچ‌داگ و تخریب پنجره
       if (Platform.isWindows) {
-        WatchdogManager().signalCleanExit();
         WatchdogManager().terminateWatchdog();
       }
-
-      // ۷. تخریب پنجره
       await windowManager.destroy();
     } catch (e) {
       debugPrint('[DesktopManager] Error during hardExit: $e');

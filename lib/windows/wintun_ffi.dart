@@ -1,5 +1,3 @@
-// ignore_for_file: non_constant_identifier_names
-
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
@@ -63,7 +61,6 @@ class WintunFFI {
 
   Pointer<Void>? _adapter;
   Pointer<Void>? _session;
-  String? _lastGatewayIp;
 
   WintunFFI() {
     if (!Platform.isWindows) return;
@@ -146,7 +143,6 @@ class WintunFFI {
     required String gatewayIp,
   }) async {
     if (!Platform.isWindows) return;
-    _lastGatewayIp = gatewayIp;
 
     await Process.run('netsh', [
       'interface',
@@ -176,26 +172,8 @@ class WintunFFI {
         'route', ['add', '128.0.0.0', 'mask', '128.0.0.0', gatewayIp, 'METRIC', '1']);
   }
 
-  /// حذف قطعی روت‌های اضافه شده در جدول مسیریابی ویندوز جهت جلوگیری از قطع اینترنت کاربر
-  Future<void> cleanupRouting({String? gatewayIp}) async {
+  void close() {
     if (!Platform.isWindows) return;
-    final gw = gatewayIp ?? _lastGatewayIp ?? '10.0.0.1';
-    try {
-      await Process.run('route', ['delete', '0.0.0.0', 'mask', '128.0.0.0', gw]);
-      await Process.run('route', ['delete', '128.0.0.0', 'mask', '128.0.0.0', gw]);
-    } catch (e) {
-      debugPrint('[WintunFFI] cleanupRouting error: $e');
-    }
-  }
-
-  void close({String? gatewayIp}) {
-    if (!Platform.isWindows) return;
-
-    final gw = gatewayIp ?? _lastGatewayIp;
-    if (gw != null) {
-      cleanupRouting(gatewayIp: gw);
-      _lastGatewayIp = null;
-    }
 
     if (_session != null && _session != nullptr && _endSession != null) {
       try {

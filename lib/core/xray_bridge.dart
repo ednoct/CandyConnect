@@ -97,19 +97,20 @@ class XrayBridge {
   }
 
   static Future<void> stopXray() async {
-    try {
-      invoke(jsonEncode({
-        "apiVersion": 1,
-        "method": "stopXray",
-        "payload": {},
-      }));
-    } catch (e) {
-      debugPrint('[XrayBridge] Error sending stopXray command: $e');
-    }
-
     if (_xrayIsolate != null) {
+      try {
+        invoke(jsonEncode({
+          "apiVersion": 1,
+          "method": "stopXray",
+          "payload": {},
+        }));
+      } catch (e) {
+        debugPrint('[XrayBridge] Error sending stopXray command: $e');
+      }
+
       // فرصت کوتاه به گوروتین‌های Go برای بستن ایمن اینترفیس TUN و سوکت‌ها
-      await Future.delayed(const Duration(milliseconds: 250));
+      await Future.delayed(const Duration(milliseconds: 300));
+
       _xrayIsolate?.kill(priority: Isolate.immediate);
       _xrayIsolate = null;
     }
@@ -126,9 +127,8 @@ class XrayBridge {
       final tempDir = Directory.systemTemp;
       for (final entity in tempDir.listSync(followLinks: false)) {
         if (entity is File) {
-          final fileName = entity.path.split(Platform.pathSeparator).last;
-          if ((fileName.startsWith('xray_config_') || fileName.startsWith('cc_bench_')) &&
-              fileName.endsWith('.json')) {
+          final fileName = entity.uri.pathSegments.last;
+          if (fileName.startsWith('xray_config_') && fileName.endsWith('.json')) {
             try {
               entity.deleteSync();
             } catch (_) {}

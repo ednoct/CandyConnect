@@ -3,14 +3,6 @@ import 'package:url_launcher/url_launcher.dart';
 
 class UrlLauncherUtils {
   static const String _defaultBotHandle = 'CandyConnectbot';
-  static String? _configuredBotHandle;
-
-  /// بروزرسانی هندل ربات تلگرام از روی کانفیگ ریموت (RemoteConfig)
-  static void setConfiguredBotHandle(String? handle) {
-    if (handle != null && handle.trim().isNotEmpty) {
-      _configuredBotHandle = _sanitizeHandle(handle);
-    }
-  }
 
   /// باز کردن پشتیبانی یا ربات تلگرام با قابلیت دریافت هندل پویا از RemoteConfig
   /// و پشتیبانی از لینک مستقیم اپلیکیشن تلگرام (tg://) همراه با پشتیبان مرورگر (https://)
@@ -18,8 +10,7 @@ class UrlLauncherUtils {
     String? customHandle,
     String? startParam,
   }) async {
-    final effective = customHandle ?? _configuredBotHandle ?? _defaultBotHandle;
-    final String handle = _sanitizeHandle(effective);
+    final String handle = _sanitizeHandle(customHandle ?? _defaultBotHandle);
     final String cleanStart = startParam?.trim() ?? '';
 
     final String tgQuery = cleanStart.isNotEmpty

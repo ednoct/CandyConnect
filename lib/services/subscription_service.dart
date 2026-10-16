@@ -69,14 +69,9 @@ class SubscriptionService {
           final dynamic decoded = jsonDecode(utf8Body);
           if (decoded is List<dynamic>) {
             return decoded;
-          } else if (decoded is Map<String, dynamic>) {
-            if (decoded['outbounds'] is List) {
-              return [decoded];
-            } else if (decoded['servers'] is List) {
-              return decoded['servers'] as List<dynamic>;
-            } else if (decoded['configs'] is List) {
-              return decoded['configs'] as List<dynamic>;
-            }
+          } else if (decoded is Map<String, dynamic> &&
+              decoded['outbounds'] is List) {
+            return [decoded];
           }
         } else if (response.statusCode == 404 ||
             response.statusCode == 401 ||
