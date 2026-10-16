@@ -7,38 +7,24 @@
 
 namespace {
 
-/// Window attribute that enables dark mode window decorations.
-///
-/// Redefined in case the developer's machine has a Windows SDK older than
-/// version 10.0.22000.0.
-/// See: https://docs.microsoft.com/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
 constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
 
-/// Registry key for app theme preference.
-///
-/// A value of 0 indicates apps should use dark mode. A non-zero or missing
-/// value indicates apps should use light mode.
-constexpr const wchar_t kGetPreferredBrightnessRegKey[] =
-  L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
-constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme";
-
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
 
+// Brush with CandyConnect OLED Dark (#0B0F19 -> R:11, G:15, B:25) to eliminate white flash
+static HBRUSH g_background_brush = nullptr;
+
 using EnableNonClientDpiScaling = BOOL __stdcall(HWND hwnd);
 
-// Scale helper to convert logical scaler values to physical using passed in
-// scale factor
 int Scale(int source, double scale_factor) {
   return static_cast<int>(source * scale_factor);
 }
 
-// Dynamically loads the |EnableNonClientDpiScaling| from the User32 module.
-// This API is only needed for PerMonitor V1 awareness mode.
 void EnableFullDpiSupportIfAvailable(HWND hwnd) {
   HMODULE user32_module = LoadLibraryA("User32.dll");
   if (!user32_module) {
@@ -55,12 +41,10 @@ void EnableFullDpiSupportIfAvailable(HWND hwnd) {
 
 }  // namespace
 
-// Manages the Win32Window's window class registration.
 class WindowClassRegistrar {
  public:
   ~WindowClassRegistrar() = default;
 
-  // Returns the singleton registrar instance.
   static WindowClassRegistrar* GetInstance() {
     if (!instance_) {
       instance_ = new WindowClassRegistrar();
@@ -68,19 +52,13 @@ class WindowClassRegistrar {
     return instance_;
   }
 
-  // Returns the name of the window class, registering the class if it hasn't
-  // previously been registered.
   const wchar_t* GetWindowClass();
-
-  // Unregisters the window class. Should only be called if there are no
-  // instances of the window.
   void UnregisterWindowClass();
 
  private:
   WindowClassRegistrar() = default;
 
   static WindowClassRegistrar* instance_;
-
   bool class_registered_ = false;
 };
 
@@ -88,6 +66,10 @@ WindowClassRegistrar* WindowClassRegistrar::instance_ = nullptr;
 
 const wchar_t* WindowClassRegistrar::GetWindowClass() {
   if (!class_registered_) {
+    if (g_background_brush == nullptr) {
+      g_background_brush = CreateSolidBrush(RGB(11, 15, 25));
+    }
+
     WNDCLASS window_class{};
     window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
     window_class.lpszClassName = kWindowClassName;
@@ -97,7 +79,7 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     window_class.hInstance = GetModuleHandle(nullptr);
     window_class.hIcon =
         LoadIcon(window_class.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
-    window_class.hbrBackground = 0;
+    window_class.hbrBackground = g_background_brush;
     window_class.lpszMenuName = nullptr;
     window_class.lpfnWndProc = Win32Window::WndProc;
     RegisterClass(&window_class);
@@ -108,6 +90,10 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
 
 void WindowClassRegistrar::UnregisterWindowClass() {
   UnregisterClass(kWindowClassName, nullptr);
+  if (g_background_brush != nullptr) {
+    DeleteObject(g_background_brush);
+    g_background_brush = nullptr;
+  }
   class_registered_ = false;
 }
 
@@ -134,10 +120,24 @@ bool Win32Window::Create(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
+  int scaled_width = Scale(size.width, scale_factor);
+  int scaled_height = Scale(size.height, scale_factor);
+
+  // محاسبه مرکز صفحه نمایش برای ایجاد اولیه پنجره
+  MONITORINFO monitor_info{};
+  monitor_info.cbSize = sizeof(monitor_info);
+  int start_x = Scale(origin.x, scale_factor);
+  int start_y = Scale(origin.y, scale_factor);
+  if (GetMonitorInfo(monitor, &monitor_info)) {
+    int work_w = monitor_info.rcWork.right - monitor_info.rcWork.left;
+    int work_h = monitor_info.rcWork.bottom - monitor_info.rcWork.top;
+    start_x = monitor_info.rcWork.left + (work_w - scaled_width) / 2;
+    start_y = monitor_info.rcWork.top + (work_h - scaled_height) / 2;
+  }
+
   HWND window = CreateWindow(
       window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
-      Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
-      Scale(size.width, scale_factor), Scale(size.height, scale_factor),
+      start_x, start_y, scaled_width, scaled_height,
       nullptr, nullptr, GetModuleHandle(nullptr), this);
 
   if (!window) {
@@ -200,7 +200,6 @@ Win32Window::MessageHandler(HWND hwnd,
     case WM_SIZE: {
       RECT rect = GetClientArea();
       if (child_content_ != nullptr) {
-        // Size and position the child window.
         MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
                    rect.bottom - rect.top, TRUE);
       }
@@ -264,25 +263,15 @@ void Win32Window::SetQuitOnClose(bool quit_on_close) {
 }
 
 bool Win32Window::OnCreate() {
-  // No-op; provided for subclasses.
   return true;
 }
 
 void Win32Window::OnDestroy() {
-  // No-op; provided for subclasses.
 }
 
 void Win32Window::UpdateTheme(HWND const window) {
-  DWORD light_mode;
-  DWORD light_mode_size = sizeof(light_mode);
-  LSTATUS result = RegGetValue(HKEY_CURRENT_USER, kGetPreferredBrightnessRegKey,
-                               kGetPreferredBrightnessRegValue,
-                               RRF_RT_REG_DWORD, nullptr, &light_mode,
-                               &light_mode_size);
-
-  if (result == ERROR_SUCCESS) {
-    BOOL enable_dark_mode = light_mode == 0;
-    DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                          &enable_dark_mode, sizeof(enable_dark_mode));
-  }
+  // برنامه CandyConnect دارای تم اختصاصی OLED Dark است؛ بنابراین همیشه حالت تیره DWM فعال می‌شود
+  BOOL enable_dark_mode = TRUE;
+  DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        &enable_dark_mode, sizeof(enable_dark_mode));
 }

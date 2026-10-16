@@ -1,1 +1,11 @@
+#include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"
 #include "Generated.xcconfig"
+
+IPHONEOS_DEPLOYMENT_TARGET = 13.0
+ENABLE_BITCODE = NO
+STRIP_INSTALLED_PRODUCT = NO
+STRIP_STYLE = non-global
+DEAD_CODE_STRIPPING = NO
+HEADER_SEARCH_PATHS = $(inherited) "$(PROJECT_DIR)/libXray/Headers"
+LIBRARY_SEARCH_PATHS = $(inherited) "$(PROJECT_DIR)/libXray" "$(PROJECT_DIR)"
+OTHER_LDFLAGS = $(inherited) -ObjC -Wl,-force_load,"$(PROJECT_DIR)/libXray/libXray.a" -lresolv -lc++ -framework SystemConfiguration -framework CoreFoundation -framework Security -framework NetworkExtension

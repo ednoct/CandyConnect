@@ -2,28 +2,33 @@ import java.util.Properties
 import java.io.FileInputStream
 
 // ---------------------------------------------------------------------------
-// Keystore / signing
+// Keystore / signing (ایمن‌سازی شده برای ویندوز محلی و لینوکس GitHub Actions)
 // ---------------------------------------------------------------------------
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+    FileInputStream(keystorePropertiesFile).use { keystoreProperties.load(it) }
 }
+
+val configuredStorePath = keystoreProperties.getProperty("storeFile")
+val resolvedStoreFile = if (!configuredStorePath.isNullOrBlank()) {
+    file(configuredStorePath)
+} else {
+    null
+}
+val hasValidReleaseKeystore =
+    keystorePropertiesFile.exists() && resolvedStoreFile != null && resolvedStoreFile.exists()
 
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
 android {
     namespace = "com.vpn.candyconnect"
-    compileSdk = flutter.compileSdkVersion
-
-    // NDK version explicitly set to the installed stable NDK on this machine.
-    // flutter.ndkVersion resolves to 28.2.13676358 which is NOT installed.
-    // Installed: 27.3.13750724 (r27d, stable) and 30.0.15729638 (r30-beta2).
-    // Using 27.3.13750724 as the stable choice that covers all 4 ABI targets.
+    compileSdk = maxOf(flutter.compileSdkVersion, 35)
     ndkVersion = "27.3.13750724"
 
     compileOptions {
@@ -31,55 +36,51 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // ---------------------------------------------------------------------------
-    // Source sets — explicit jniLibs mapping for Xray/Go native binaries.
-    //
-    // libgojni.so (the Xray/Go JNI library) is already deployed under:
-    //   app/src/main/jniLibs/{arm64-v8a, armeabi-v7a, x86, x86_64}/libgojni.so
-    //
-    // The explicit srcDirs declaration below makes the ABI→SO linkage
-    // unambiguous and immune to future sourceSets reconfigurations.
-    //
-    // Flutter assets (assets/ and assets/routing/ containing geoip.dat and
-    // geosite.dat) are declared in pubspec.yaml and bundled automatically by
-    // the Flutter Gradle Plugin — no manual aapt/assets block is required.
-    // ---------------------------------------------------------------------------
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
         }
     }
 
+    // تضمین استخراج مستقیم و فشرده‌نشده libXray.so در تمامی معماری‌ها برای کارکرد بی‌نقص Dart FFI
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     defaultConfig {
         applicationId = "com.vpn.candyconnect"
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        minSdk = maxOf(flutter.minSdkVersion, 23)
+        targetSdk = maxOf(flutter.targetSdkVersion, 35)
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
     signingConfigs {
         create("release") {
-            if (keystorePropertiesFile.exists()) {
-                keyAlias     = keystoreProperties["keyAlias"]     as String
-                keyPassword  = keystoreProperties["keyPassword"]  as String
-                storeFile    = file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
+            if (hasValidReleaseKeystore && resolvedStoreFile != null) {
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeFile = resolvedStoreFile
+                storePassword = keystoreProperties.getProperty("storePassword")
             }
         }
     }
 
     buildTypes {
         release {
-            // Use the upload keystore when key.properties is present;
-            // otherwise fall back to debug keys so `flutter run --release` works.
-            signingConfig = if (keystorePropertiesFile.exists()) {
+            signingConfig = if (hasValidReleaseKeystore) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")
             }
             isMinifyEnabled = false
             isShrinkResources = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
         debug {
             signingConfig = signingConfigs.getByName("debug")
@@ -87,25 +88,16 @@ android {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Kotlin compiler options — keep in sync with compileOptions above.
-// ---------------------------------------------------------------------------
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
 }
 
-// ---------------------------------------------------------------------------
-// Flutter source root (two levels up from android/app/)
-// ---------------------------------------------------------------------------
 flutter {
     source = "../.."
 }
 
-// ---------------------------------------------------------------------------
-// Bypass strict AAR metadata checks for AGP version requirements
-// ---------------------------------------------------------------------------
 tasks.withType(Task::class.java).configureEach {
     if (name.contains("AarMetadata")) {
         enabled = false

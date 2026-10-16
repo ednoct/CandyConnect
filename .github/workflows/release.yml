@@ -233,7 +233,7 @@ jobs:
           Terminal=false
           Categories=Network;Security;VPN;
           StartupNotify=true
-          StartupWMClass=${BIN_NAME}
+          StartupWMClass=online.candyconnect.candyconnect
           EOF
 
           cat <<'EOF' > "${PKG_DIR}/DEBIAN/postinst"
@@ -313,7 +313,7 @@ jobs:
           Terminal=false
           Categories=Network;Security;VPN;
           StartupNotify=true
-          StartupWMClass=${BIN_NAME}
+          StartupWMClass=online.candyconnect.candyconnect
           ENTRY
 
           chmod +x "\$DESKTOP_FILE"
@@ -444,6 +444,26 @@ jobs:
                   print(f"[FIXED] Injected namespace '{pkg_name}' into {gradle_path}")
           EOF
 
+      - name: Configure Android Signing Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            mkdir -p android/app
+            echo "$KEYSTORE_BASE64" | tr -d ' \n\r' | base64 -d > android/app/upload-keystore.jks
+            cat <<EOF > android/key.properties
+          storePassword=$STORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=upload-keystore.jks
+          EOF
+          else
+            rm -f android/key.properties
+          fi
+
       - name: Inject CANDY_PAT & Build Split and Universal APKs
         env:
           CANDY_PAT: ${{ secrets.CANDY_PAT }}
@@ -502,7 +522,11 @@ jobs:
           if [ -f "lib/services/remote_config_service.dart" ]; then
             sed -i '' "s|'CANDY_PAT'|'${CANDY_PAT}'|g" lib/services/remote_config_service.dart
           fi
+          if [ -f "macos/Podfile" ]; then
+            sed -i '' "s|platform :mac_os|platform :osx|g" macos/Podfile
+          fi
           flutter config --enable-macos-desktop
+          flutter config --enable-swift-package-manager
           flutter pub get
           flutter build macos --release --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
 
@@ -553,6 +577,7 @@ jobs:
           if [ -f "lib/services/remote_config_service.dart" ]; then
             sed -i '' "s|'CANDY_PAT'|'${CANDY_PAT}'|g" lib/services/remote_config_service.dart
           fi
+          flutter config --enable-swift-package-manager
           flutter pub get
           flutter build ios --release --no-codesign --dart-define=CANDY_PAT="${CANDY_PAT}" --dart-define=REMOTE_CONFIG_PAT="${CANDY_PAT}"
 

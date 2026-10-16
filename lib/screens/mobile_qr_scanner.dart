@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:zxing2/qrcode.dart';
+import 'package:zxing2/qrcode.dart' hide BarcodeFormat;
 import 'package:image/image.dart' as img;
 import '../theme/app_theme.dart';
 

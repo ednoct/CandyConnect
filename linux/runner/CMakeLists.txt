@@ -9,12 +9,16 @@ project(runner LANGUAGES CXX)
 add_executable(${BINARY_NAME}
   "main.cc"
   "my_application.cc"
+  "../tun_service.cc"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
 )
 
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+
+# Export C symbols (such as allocate_tun_device) so DynamicLibrary.process() can resolve them
+set_target_properties(${BINARY_NAME} PROPERTIES ENABLE_EXPORTS TRUE)
 
 # Add preprocessor definitions for the application ID.
 add_definitions(-DAPPLICATION_ID="${APPLICATION_ID}")

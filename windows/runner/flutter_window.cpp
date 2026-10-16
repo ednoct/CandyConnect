@@ -4,6 +4,24 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+namespace {
+
+/// غیرفعال‌سازی پروکسی سیستم هنگام خاموش شدن یا خروج از حساب ویندوز (WM_ENDSESSION)
+void ClearSystemProxyOnShutdown() {
+  HKEY hKey = nullptr;
+  const wchar_t* regPath =
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+  if (::RegOpenKeyExW(HKEY_CURRENT_USER, regPath, 0, KEY_SET_VALUE, &hKey) ==
+      ERROR_SUCCESS) {
+    DWORD disable = 0;
+    ::RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD,
+                     reinterpret_cast<const BYTE*>(&disable), sizeof(disable));
+    ::RegCloseKey(hKey);
+  }
+}
+
+}  // namespace
+
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -27,13 +45,8 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
-  });
-
-  // Flutter can complete the first frame before the "show window" callback is
-  // registered. The following call ensures a frame is pending to ensure the
-  // window is shown. It is a no-op if the first frame hasn't completed yet.
+  // توجه: نمایش پنجره (windowManager.show) توسط DesktopManager.init() پس از مخفی‌سازی
+  // نوار عنوان پیش‌فرض ویندوز انجام می‌شود تا پرش کادر سفید در استارت‌آپ رخ ندهد.
   flutter_controller_->ForceRedraw();
 
   return true;
@@ -48,7 +61,8 @@ void FlutterWindow::OnDestroy() {
 }
 
 LRESULT
-FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
+FlutterWindow::MessageHandler(HWND hwnd,
+                              UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
   // Give Flutter, including plugins, an opportunity to handle window messages.
@@ -64,6 +78,12 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   switch (message) {
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+
+    case WM_ENDSESSION:
+      if (wparam == TRUE) {
+        ClearSystemProxyOnShutdown();
+      }
       break;
   }
 

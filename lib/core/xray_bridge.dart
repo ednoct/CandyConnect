@@ -21,6 +21,7 @@ class XrayBridge {
 
   static Isolate? _xrayIsolate;
   static ReceivePort? _receivePort;
+  static bool _isCoreRunning = false;
   static String? _verifiedAssetDir;
 
   static void init() {
@@ -29,28 +30,91 @@ class XrayBridge {
     if (Platform.isAndroid) {
       _lib = DynamicLibrary.open('libXray.so');
     } else if (Platform.isLinux) {
-      final exeDir = File(Platform.resolvedExecutable).parent.path;
-      final libInSubdir = File('$exeDir/lib/libXray.so');
-      final libInExeDir = File('$exeDir/libXray.so');
-
-      if (libInSubdir.existsSync()) {
-        _lib = DynamicLibrary.open(libInSubdir.path);
-      } else if (libInExeDir.existsSync()) {
-        _lib = DynamicLibrary.open(libInExeDir.path);
-      } else {
-        _lib = DynamicLibrary.open('libXray.so');
-      }
+      _lib = _openLinuxLibrary();
     } else if (Platform.isWindows) {
-      final exeDir = File(Platform.resolvedExecutable).parent.path;
-      _lib = DynamicLibrary.open('$exeDir\\libXray.dll');
+      _lib = _openWindowsLibrary();
     } else if (Platform.isIOS || Platform.isMacOS) {
-      // Statically linked into the runner binary
-      _lib = DynamicLibrary.process();
+      _lib = _openAppleLibrary();
     }
 
     _invoke = _lib.lookupFunction<CGoInvokeC, CGoInvokeDart>('CGoInvoke');
     _free = _lib.lookupFunction<CGoFreeC, CGoFreeDart>('CGoFree');
     _initialized = true;
+  }
+
+  /// بارگذاری ضدخطای libXray.dll در ویندوز (پشتیبانی از مسیر اجرایی، Symlink و مسیر کاری پس از UAC)
+  static DynamicLibrary _openWindowsLibrary() {
+    String resolvedExePath = Platform.resolvedExecutable;
+    try {
+      resolvedExePath = File(resolvedExePath).resolveSymbolicLinksSync();
+    } catch (_) {}
+
+    final exeDir = File(resolvedExePath).parent.path;
+    final candidates = <String>[
+      '$exeDir\\libXray.dll',
+      '${Directory.current.path}\\libXray.dll',
+    ];
+
+    for (final path in candidates) {
+      if (File(path).existsSync()) {
+        return DynamicLibrary.open(path);
+      }
+    }
+
+    return DynamicLibrary.open('libXray.dll');
+  }
+
+  /// بارگذاری ضدخطای libXray.so در لینوکس (پشتیبانی از باندل، پکیج .deb در /opt و Symlink در /usr/bin)
+  static DynamicLibrary _openLinuxLibrary() {
+    String resolvedExePath = Platform.resolvedExecutable;
+    try {
+      resolvedExePath = File(resolvedExePath).resolveSymbolicLinksSync();
+    } catch (_) {}
+
+    final exeDir = File(resolvedExePath).parent.path;
+    final candidates = <String>[
+      '$exeDir/lib/libXray.so',
+      '$exeDir/libXray.so',
+      '/opt/CandyConnect/lib/libXray.so',
+      '/opt/CandyConnect/libXray.so',
+      '/usr/lib/libXray.so',
+    ];
+
+    for (final path in candidates) {
+      if (File(path).existsSync()) {
+        return DynamicLibrary.open(path);
+      }
+    }
+
+    return DynamicLibrary.open('libXray.so');
+  }
+
+  /// بارگذاری ضدخطای کتابخانه Xray در اکوسیستم اپل (iOS Static Archive و macOS Bundle)
+  static DynamicLibrary _openAppleLibrary() {
+    final processLib = DynamicLibrary.process();
+    if (processLib.providesSymbol('CGoInvoke')) {
+      return processLib;
+    }
+
+    final executableLib = DynamicLibrary.executable();
+    if (executableLib.providesSymbol('CGoInvoke')) {
+      return executableLib;
+    }
+
+    if (Platform.isMacOS) {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      final candidates = [
+        '$exeDir/../Frameworks/libXray.dylib',
+        '$exeDir/libXray.dylib',
+      ];
+      for (final path in candidates) {
+        if (File(path).existsSync()) {
+          return DynamicLibrary.open(path);
+        }
+      }
+    }
+
+    return processLib;
   }
 
   /// فراخوانی ایمن FFI با تضمین آزادسازی حافظه Native در تمام شرایط
@@ -82,6 +146,7 @@ class XrayBridge {
 
     final receivePort = ReceivePort();
     _receivePort = receivePort;
+    _isCoreRunning = true;
 
     receivePort.listen((message) {
       if (message is String) {
@@ -97,7 +162,8 @@ class XrayBridge {
   }
 
   static Future<void> stopXray() async {
-    if (_xrayIsolate != null) {
+    if (_xrayIsolate != null || _isCoreRunning) {
+      _isCoreRunning = false;
       try {
         invoke(jsonEncode({
           "apiVersion": 1,
@@ -125,10 +191,13 @@ class XrayBridge {
   static void _cleanupStaleTempConfigs() {
     try {
       final tempDir = Directory.systemTemp;
+      if (!tempDir.existsSync()) return;
       for (final entity in tempDir.listSync(followLinks: false)) {
         if (entity is File) {
           final fileName = entity.uri.pathSegments.last;
-          if (fileName.startsWith('xray_config_') && fileName.endsWith('.json')) {
+          if ((fileName.startsWith('xray_config_') ||
+                  fileName.startsWith('cc_bench_')) &&
+              fileName.endsWith('.json')) {
             try {
               entity.deleteSync();
             } catch (_) {}
@@ -145,6 +214,9 @@ class XrayBridge {
 
     try {
       final tempDir = Directory.systemTemp;
+      if (!tempDir.existsSync()) {
+        tempDir.createSync(recursive: true);
+      }
       final uniqueSuffix =
           '${DateTime.now().microsecondsSinceEpoch}_${Isolate.current.hashCode}';
       tempFile = File('${tempDir.path}/xray_config_$uniqueSuffix.json');
@@ -183,6 +255,10 @@ class XrayBridge {
     }
 
     final dir = await getApplicationDocumentsDirectory();
+    if (!dir.existsSync()) {
+      await dir.create(recursive: true);
+    }
+
     for (final name in ['geoip.dat', 'geosite.dat']) {
       final dest = File('${dir.path}/$name');
       final assetData = await rootBundle.load('assets/routing/$name');

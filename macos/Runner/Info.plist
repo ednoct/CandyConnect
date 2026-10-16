@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>CandyConnect</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIconFile</key>
@@ -14,8 +16,6 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
-	<key>CFBundleDisplayName</key>
-	<string>CandyConnect</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -23,7 +23,26 @@
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<string>11.0</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>tg</string>
+		<string>https</string>
+		<string>http</string>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>برای اسکن بارکد (QR Code) اشتراک، برنامه نیاز به دسترسی به دوربین دارد.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>برای خواندن بارکد (QR Code) از روی مانیتور مک، برنامه به دسترسی ضبط صفحه نیاز دارد.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>برای اشتراک‌گذاری اتصال در شبکه محلی (LAN) و بهینه‌سازی مسیریابی، برنامه از شبکه محلی استفاده می‌کند.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMainNibFile</key>

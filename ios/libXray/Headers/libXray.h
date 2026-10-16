@@ -2,7 +2,6 @@
 
 /* package github.com/xtls/libxray/cgo_bridge */
 
-
 #line 1 "cgo-builtin-export-prolog"
 
 #include <stddef.h>
@@ -19,17 +18,12 @@ extern const char *_GoStringPtr(_GoString_ s);
 #endif
 
 /* Start of preamble from import "C" comments.  */
-
-
 #line 3 "main.go"
 
 #include <stdlib.h>
 
 #line 1 "cgo-generated-wrapper"
-
-
 /* End of preamble from import "C" comments.  */
-
 
 /* Start of boilerplate cgo prologue.  */
 #line 1 "cgo-gcc-export-header-prolog"

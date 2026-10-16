@@ -1,2 +1,11 @@
 #include "../../Flutter/Flutter-Debug.xcconfig"
 #include "Warnings.xcconfig"
+
+MACOSX_DEPLOYMENT_TARGET = 11.0
+DEAD_CODE_STRIPPING = NO
+STRIP_INSTALLED_PRODUCT = NO
+STRIP_STYLE = non-global
+SWIFT_OBJC_BRIDGING_HEADER = Runner/Runner-Bridging-Header.h
+HEADER_SEARCH_PATHS = $(inherited) "$(PROJECT_DIR)/libXray/Headers"
+LIBRARY_SEARCH_PATHS = $(inherited) "$(PROJECT_DIR)/libXray" "$(PROJECT_DIR)"
+OTHER_LDFLAGS = $(inherited) -ObjC -Wl,-force_load,"$(PROJECT_DIR)/libXray/libXray.a" -lresolv -lc++ -framework SystemConfiguration -framework CoreFoundation -framework Security -framework NetworkExtension

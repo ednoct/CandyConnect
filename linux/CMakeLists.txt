@@ -13,8 +13,9 @@ set(APPLICATION_ID "online.candyconnect.candyconnect")
 # versions of CMake.
 cmake_policy(SET CMP0063 NEW)
 
-# Load bundled libraries from the lib/ directory relative to the binary.
-set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
+# Load bundled libraries from the lib/ directory and binary directory relative to the executable.
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib:$ORIGIN")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
 # Root filesystem for cross-building.
 if(FLUTTER_TARGET_PLATFORM_SYSROOT)
@@ -35,13 +36,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # Compilation settings that should be applied to most targets.
-#
-# Be cautious about adding new options here, as plugins use this function by
-# default. In most cases, you should add new options to specific targets instead
-# of modifying this function.
+# Avoid -Werror here so third-party GTK plugins (tray_manager, window_manager, etc.)
+# do not fail compilation on newer GCC/Clang deprecation warnings.
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_14)
-  target_compile_options(${TARGET} PRIVATE -Wall -Werror)
+  target_compile_options(${TARGET} PRIVATE -Wall -Wno-deprecated-declarations -Wno-unused-parameter)
   target_compile_options(${TARGET} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O3>")
   target_compile_definitions(${TARGET} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:NDEBUG>")
 endfunction()
@@ -61,14 +60,11 @@ add_subdirectory("runner")
 add_dependencies(${BINARY_NAME} flutter_assemble)
 
 # Only the install-generated bundle's copy of the executable will launch
-# correctly, since the resources must in the right relative locations. To avoid
-# people trying to run the unbundled copy, put it in a subdirectory instead of
-# the default top-level location.
+# correctly, since the resources must be in the right relative locations.
 set_target_properties(${BINARY_NAME}
   PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/intermediates_do_not_run"
 )
-
 
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
@@ -100,14 +96,30 @@ install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}
 install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+# Detect target CPU architecture (supporting both native builds and Flutter cross-builds)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR FLUTTER_TARGET_PLATFORM MATCHES "arm64")
   set(XRAY_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libxray-arm64")
 else()
   set(XRAY_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libxray-x64")
 endif()
 
-install(FILES "${XRAY_LIB_DIR}/libXray.so" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+# Bundle libXray.so into both bundle/lib/ and bundle/ root for guaranteed FFI resolution
+install(FILES "${XRAY_LIB_DIR}/libXray.so"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  OPTIONAL
   COMPONENT Runtime)
+
+install(FILES "${XRAY_LIB_DIR}/libXray.so"
+  DESTINATION "${CMAKE_INSTALL_PREFIX}"
+  OPTIONAL
+  COMPONENT Runtime)
+
+# Bundle application icon if present
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app_icon.png")
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/app_icon.png"
+    DESTINATION "${CMAKE_INSTALL_PREFIX}"
+    COMPONENT Runtime)
+endif()
 
 foreach(bundled_library ${PLUGIN_BUNDLED_LIBRARIES})
   install(FILES "${bundled_library}"
@@ -117,9 +129,11 @@ endforeach(bundled_library)
 
 # Copy the native assets provided by the build.dart from all packages.
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/linux/")
-install(DIRECTORY "${NATIVE_ASSETS_DIR}"
-   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-   COMPONENT Runtime)
+if(EXISTS "${NATIVE_ASSETS_DIR}")
+  install(DIRECTORY "${NATIVE_ASSETS_DIR}"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+endif()
 
 # Fully re-copy the assets directory on each build to avoid having stale files
 # from a previous install.

@@ -29,9 +29,10 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 add_definitions(-DUNICODE -D_UNICODE)
 
 # Compilation settings applied to targets.
+# Use /WX- and /utf-8 so third-party Windows plugins compile cleanly on newer MSVC toolchains.
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
-  target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
+  target_compile_options(${TARGET} PRIVATE /W4 /WX- /utf-8 /wd"4100" /wd"4996" /wd"4244" /wd"4267")
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
@@ -44,9 +45,10 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
-# Fail-Safe Watchdog build
+# Fail-Safe Watchdog build (Windowless Win32 background guardian)
 add_executable(candy_watchdog WIN32 "runner/watchdog.cpp")
 APPLY_STANDARD_SETTINGS(candy_watchdog)
+target_link_libraries(candy_watchdog PRIVATE advapi32 user32)
 
 # Generated plugin build rules.
 include(flutter/generated_plugins.cmake)
@@ -63,6 +65,7 @@ set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
 install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)
+
 install(TARGETS candy_watchdog RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)
 
@@ -72,18 +75,25 @@ install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}
 install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
-# Install libXray DLL
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libxray/libXray.dll")
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/libxray/libXray.dll" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-    COMPONENT Runtime)
-endif()
+# Install libXray DLL, Wintun, and WinDivert drivers directly alongside candyconnect.exe
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/libxray/libXray.dll"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime OPTIONAL)
 
-# Install Wintun and WinDivert drivers for Zero-Leak Architecture
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/wintun/wintun.dll" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/wintun/wintun.dll"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime OPTIONAL)
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/windivert/WinDivert.dll" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/windivert/WinDivert.dll"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime OPTIONAL)
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/windivert/WinDivert64.sys" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/windivert/WinDivert64.sys"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime OPTIONAL)
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/windivert/WinDivert32.sys"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime OPTIONAL)
 
 if(PLUGIN_BUNDLED_LIBRARIES)
@@ -96,8 +106,8 @@ endif()
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")
 if(EXISTS "${NATIVE_ASSETS_DIR}")
   install(DIRECTORY "${NATIVE_ASSETS_DIR}"
-     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-     COMPONENT Runtime)
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
 endif()
 
 # Re-copy flutter assets

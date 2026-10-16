@@ -2,8 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSCameraUsageDescription</key>
-	<string>برای اسکن کد QR لایسنس به دوربین نیاز است</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
@@ -28,6 +26,33 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>برای اسکن بارکد (QR Code) اشتراک، برنامه نیاز به دسترسی به دوربین دارد.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>برای انتخاب تصویر بارکد (QR Code) اشتراک از گالری، برنامه نیاز به دسترسی به تصاویر دارد.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>برای ذخیره اطلاعات اشتراک در گالری، برنامه نیاز به دسترسی دارد.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>برای اشتراک‌گذاری اتصال در شبکه محلی (LAN) و بهینه‌سازی مسیریابی، برنامه از شبکه محلی استفاده می‌کند.</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>tg</string>
+		<string>https</string>
+		<string>http</string>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>network-authentication</string>
+		<string>processing</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -55,6 +80,10 @@
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
 	<string>Main</string>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
